@@ -161,3 +161,14 @@ def test_benchmark_compares_identical_metadata_in_fresh_processes(tmp_path):
     assert {r["engine"] for r in report["trials"]} == {"json", "sqlite"}
     assert all(r["result_sha256"] == report["result_sha256"] for r in report["trials"])
     assert report["records"] == 23
+
+
+@pytest.mark.parametrize("column", ["key", "payload"])
+def test_page_rejects_nontext_sqlite_values_before_encoding(tmp_path, column):
+    target = tmp_path / "catalog"
+    write_catalog(target, [("a", 1)])
+    with sqlite3.connect(target) as connection:
+        connection.execute(f"UPDATE entries SET {column}=?", (sqlite3.Binary(b"invalid"),))
+    with Catalog(target) as catalog:
+        with pytest.raises(ValueError, match="text keys"):
+            catalog.page()

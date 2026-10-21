@@ -239,6 +239,8 @@ class Catalog:
         )
         try:
             for row in cursor:
+                if not isinstance(row[1], str) or not isinstance(row[2], str):
+                    raise ValueError("catalog record must contain text keys and JSON payloads")
                 encoded = len(row[1].encode("utf-8")) + len(row[2].encode("utf-8"))
                 if size + encoded > max_bytes:
                     if not result:
