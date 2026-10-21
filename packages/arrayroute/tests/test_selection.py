@@ -50,6 +50,15 @@ def test_petabyte_plan_is_constant_size():
     assert first.plan.buffer_bytes_upper_bound <= 8 << 20
 
 
+def test_splits_reduce_decoded_chunks_before_subdividing_spatial_cells():
+    spec = ArraySpec((20, 32, 32, 32, 1), (1, 32, 32, 32, 1), 4)
+    regions = list(itertools.islice(tiles(spec, (slice(None),) * 5, buffer_bytes=1 << 20), 20))
+    assert len(regions) == 8
+    assert sum(t.plan.output_bytes for t in regions) == spec.logical_bytes
+    assert sum(t.plan.decoded_bytes_upper_bound for t in regions) == spec.logical_bytes
+    assert all(t.plan.buffer_bytes_upper_bound <= 1 << 20 for t in regions)
+
+
 @pytest.mark.parametrize(
     "selection",
     [

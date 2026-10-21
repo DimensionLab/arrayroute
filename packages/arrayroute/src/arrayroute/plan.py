@@ -112,7 +112,15 @@ def tiles(spec: ArraySpec, selection: Selection, *, buffer_bytes: int) -> Iterat
         ]
         if not options:
             raise MemoryError("One decoded chunk exceeds the buffer budget; rechunk the array")
-        axis, sel = max(options, key=lambda pair: _length(pair[1]) * pair[1].step)
+        def split_priority(pair: tuple[int, slice]) -> tuple[int, int]:
+            axis, region = pair
+            count = _length(region)
+            last = region.start + (count - 1) * region.step
+            touched = min(count, last // spec.chunks[axis] - region.start // spec.chunks[axis] + 1)
+            # Cutting within one chunk cannot reduce decoded bytes. Split across chunks first.
+            return touched, count
+
+        axis, sel = max(options, key=split_priority)
         count = _length(sel)
         chunk = spec.chunks[axis]
         midpoint = sel.start + (count // 2) * sel.step
