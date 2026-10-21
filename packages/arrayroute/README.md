@@ -242,3 +242,35 @@ Accumulators retain statistics, not input arrays. Workers can merge assessments 
 with the same tolerance over disjoint blocks. Comparison scratch is proportional to the
 supplied block, so keep blocks bounded. This checks field reconstruction only; accuracy
 of gradients, integrals, spectra or other derived quantities needs its own assessment.
+
+## Spatial grid storage policy
+
+`arrayroute.layout.GridLayoutPolicy` chooses bounded spatial chunks and optional Zarr v3
+shards without inspecting values or enumerating the chunk grid:
+
+```python
+import zarr
+from arrayroute.layout import GridLayoutPolicy
+
+layout = GridLayoutPolicy().plan(
+    (20, 128, 128, 128, 3),
+    itemsize=4,
+    spatial_axes=(1, 2, 3),
+    time_axis=0,
+)
+# chunks=(1,32,32,32,3), shards=(1,128,128,128,3)
+group = zarr.open_group("velocity.zarr", mode="w-")
+array = group.create_array(
+    "velocity", shape=(20,128,128,128,3), dtype="float32",
+    chunks=layout.chunks, shards=layout.shards,
+)
+```
+
+The defaults target 32-cell chunk edges, 128-cell shard edges, at most 512 KiB decoded
+per chunk and 32 MiB decoded per shard, including edge padding. Byte limits take priority
+over edge targets and requested time steps per chunk. Small arrays remain unsharded.
+The policy reports an upper bound on storage-object count; it does not predict compressed
+size, temporary codec memory or transport bytes. This is a configurable balanced heuristic,
+not an automatically optimal layout. Full-volume training, sparse regions, object stores
+and local filesystems can favor different choices. The policy neither converts values nor
+selects a compressor; lossless versus lossy encoding remains explicit.
