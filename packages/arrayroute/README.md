@@ -537,3 +537,53 @@ may help a compute-heavy consumer or may add overhead. `python -m
 arrayroute.benchmark_prefetch --root /tmp/read-overlap` compares identical serial and
 prefetched tiles, verifies fixture hashes and every resulting stream digest/reduction,
 and records first-party Zarr/TensorStore results without a universal speed claim.
+
+## Indexed metadata snapshots
+
+`arrayroute.catalog` stores keyed JSON records in a standard SQLite file. Use it when
+opening a complete JSON manifest becomes expensive: a lookup uses the unique-key index,
+and pagination uses the integer primary key without scanning earlier pages. It has no
+solver-specific schema and does not change or compress the arrays referenced by records.
+
+```python
+from arrayroute.catalog import Catalog, write_catalog
+
+receipt = write_catalog(
+    "simulation-catalog.sqlite",
+    ((case.id, case.metadata) for case in cases),
+    metadata={"schema": "my-cases-v1"},
+)
+with Catalog(receipt.path, expected_revision=receipt.revision) as catalog:
+    first_page = catalog.page(limit=20, max_bytes=8 << 20)
+    one_case = catalog.get("case-123")
+```
+
+Writers consume the iterable once, use an 8 MiB SQLite cache by default, and publish
+using a same-directory hard link after committing and syncing the file. The destination
+must not exist. Duplicate keys, interrupted iterators, invalid JSON and oversized records
+abort publication. Individual JSON records are limited to 1 MiB, keys to 4,096 UTF-8 bytes,
+and pages to 4,096 records and 64 MiB of encoded payloads. Decoded Python objects, SQL
+engine overhead and the OS cache are additional memory; this is not a process RSS limit.
+
+A reader holds a read transaction for its context lifetime. Open separate readers in
+separate threads/processes. Do not modify a published snapshot in place: publish a new
+file and distribute its receipt. Reads use `mode=ro`, normal SQLite locking, a validated
+schema, `trusted_schema=OFF` and no memory mapping. No extension loading or user-supplied
+SQL is exposed. This is a local-filesystem catalog, not a remote range-read index or a
+multi-writer distributed database. Use a supported, security-maintained SQLite runtime.
+
+Per-record hashes detect accidental damage. The receipt contains a logical revision and
+SHA-256 of the entire file. `expected_revision` checks the header identity; it does not
+prove every unread record. Call `catalog.verify()` for a complete logical integrity scan,
+or verify the file against a trusted receipt before use. A malicious party able to rewrite
+records and hashes can fabricate a new catalog; authenticate receipts outside this library.
+
+The deterministic benchmark creates unique metadata records, compares fresh-process
+first-page and last-key lookup against full JSON loading, checks equal results, and records
+publication time, file size, latency and peak RSS:
+
+```sh
+python -m arrayroute.benchmark_catalog --out /tmp/catalog-million --records 1000000 --repeats 5
+```
+
+It measures local metadata access, not numerical throughput or petabyte storage performance.
