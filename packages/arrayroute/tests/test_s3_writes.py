@@ -153,7 +153,7 @@ def test_preparation_refuses_unsafe_storage_before_opening_or_mutating_repositor
 @pytest.mark.parametrize("create,update", [(False, True), (True, False), (False, False)])
 def test_endpoint_support_cannot_override_unsafe_repository_config(monkeypatch, create, update):
     ic = pytest.importorskip("icechunk")
-    import arrayroute.preparation as module
+    import arrayroute.snapshot as module
     from arrayroute.snapshot import S3Repository
 
     config = ic.RepositoryConfig(
@@ -170,7 +170,7 @@ def test_endpoint_support_cannot_override_unsafe_repository_config(monkeypatch, 
 @pytest.mark.parametrize("explicit", [False, True])
 def test_safe_s3_repository_defaults_and_explicit_settings_are_accepted(monkeypatch, explicit):
     ic = pytest.importorskip("icechunk")
-    import arrayroute.preparation as module
+    import arrayroute.snapshot as module
     from arrayroute.snapshot import S3Repository
 
     config = ic.RepositoryConfig()
@@ -181,3 +181,18 @@ def test_safe_s3_repository_defaults_and_explicit_settings_are_accepted(monkeypa
     repo = SimpleNamespace(config=config)
     monkeypatch.setattr(module, "_repository", lambda _location: repo)
     assert module._writable_repository(S3Repository(S3Store("test-bucket"))) is repo
+
+
+def test_retention_rechecks_storage_after_pickle_before_creating_references(monkeypatch):
+    pytest.importorskip("icechunk")
+    from arrayroute.retention import RetentionManager
+    from arrayroute.snapshot import S3Repository, Snapshot
+
+    fake = probe(monkeypatch, "ignore-create")
+    location = S3Repository(S3Store("test-bucket"))
+    manager = RetentionManager(location)
+    manager._writes_checked = True
+    restored = pickle.loads(pickle.dumps(manager))
+    with pytest.raises(UnsafeObjectStoreError):
+        restored.retain(Snapshot(location, "nonexistent"), purpose="reader")
+    assert fake.data == {} and fake.closed

@@ -65,6 +65,42 @@ def _storage(location: RepositoryLocation):
     )
 
 
+def _verify_storage(location: RepositoryLocation) -> None:
+    if isinstance(location, S3Repository):
+        from .s3_writes import verify_s3_writes
+
+        verify_s3_writes(
+            location.store,
+            allow_http=location.allow_http,
+            force_path_style=location.force_path_style,
+        )
+
+
+def _repository(location: RepositoryLocation):
+    import icechunk as ic
+
+    return ic.Repository.open(_storage(location), authorize_virtual_chunk_access={})
+
+
+def _writable_repository(location: RepositoryLocation):
+    repo = _repository(location)
+    if isinstance(location, S3Repository):
+        from .s3_writes import UnsafeObjectStoreError
+
+        settings = repo.config.storage
+        # None inherits the S3 backend's safe defaults. An explicit False disables
+        # conditional writes even when the endpoint itself passed the capability probe.
+        if settings is not None and (
+            settings.unsafe_use_conditional_create is False
+            or settings.unsafe_use_conditional_update is False
+        ):
+            raise UnsafeObjectStoreError(
+                "Repository configuration disables conditional writes; restore safe settings "
+                "before preparing data"
+            )
+    return repo
+
+
 @dataclass(frozen=True)
 class Snapshot:
     """Serializable revision reference. It is not a backup or a garbage-collection lease.

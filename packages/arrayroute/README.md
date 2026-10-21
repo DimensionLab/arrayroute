@@ -380,7 +380,9 @@ repository; local cooperative writes have been tested, multi-host object-store w
 remain to be validated. Never run concurrent committers against a filesystem repository.
 A failed initialization may leave a reserved staging branch; inspect it before cleanup.
 Uncommitted failed worker chunks can remain unreachable until repository maintenance.
-The published revision still needs retention protection from the repository owner.
+Preparation now retains its input and verified output using durable revision tags.
+Persist `job.input_pin` and `job.output_pin(published)` with the owning job/dataset before
+removing its work branch. References remain until the owner explicitly releases them.
 
 Run `python -m arrayroute.benchmark_preparation --root NEW_DIRECTORY` for a reproducible
 synthetic pilot comparing commit batches and thread/spawn executors, plus a forced failure
@@ -416,3 +418,45 @@ that tested configuration was refused for transactional preparation. Read-only a
 unaffected. Passing this probe is an observation, not proof of persistence, replicated
 consensus, all race conditions or multipart-upload semantics. Recheck after endpoint changes;
 the result is cached only in the current preparation object, never persisted as a certificate.
+
+### Keep revisions available to jobs and reports
+
+An immutable snapshot ID alone does not prevent cleanup. Retention references protect
+the exact snapshot and its reachable chunks using Icechunk tags:
+
+```python
+from arrayroute.retention import RetentionManager
+from arrayroute.snapshot import SnapshotReadSession
+
+retention = RetentionManager(snapshot.location)
+pin = retention.retain(snapshot, purpose="training")
+# Persist pin with the training job before distributing snapshot to workers.
+reader = SnapshotReadSession(pin.snapshot)
+values = reader.read("velocity", (0, slice(None), slice(None), slice(None), 0))
+retention.verify(pin)
+# Release only after this consumer and all its workers no longer need the revision.
+retention.release(pin)
+```
+
+Each consumer uses its own token. Multiple jobs/reports can protect the same revision;
+releasing one does not release the others. A reference survives process exit and pickle
+round trips. Nothing releases it implicitly. For retryable orchestration, allocate and
+persist a 32-character lowercase hex token before calling `retain(..., token=token)`.
+Reusing that token for the same snapshot is idempotent; retargeting is refused. Deleted
+tokens cannot be reused because Icechunk tombstones tag names. `pins()` inventories managed
+references; it scales with tag count, and the underlying engine materializes the tag set.
+The application stores owner names, tenant permissions and lifecycle state in its catalog.
+
+Preparation configuration version 2 stores separate input/output tokens. Input protection
+is acquired before creating the work branch. Publication verifies all output bytes,
+commits completion, then creates the output tag; an interrupted tag response can be retried.
+The work branch protects that interval. A failed initialization can leave an input pin;
+inspect the inventory when reconciling failed jobs rather than expiring it automatically.
+Older preparation configurations must be recreated; completed ordinary snapshots are readable.
+
+Cleanup must preserve tags and branch tips (`delete_expired_tags=False`,
+`delete_expired_branches=False`). Physical garbage collection is a separate administrative
+operation. Its cutoff must predate all in-flight writes; coordinate active writers before
+reclamation. These references do not authorize unsafe cutoff selection, bypassing tags,
+deleting external virtual objects, or deleting a bucket. They are not backups or expiring
+leases. ArrayRoute does not start a background destructive cleaner.

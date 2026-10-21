@@ -14,6 +14,7 @@ import json
 import math
 import re
 import threading
+import uuid
 from collections.abc import Callable, Iterator
 from concurrent.futures import Executor
 from dataclasses import dataclass
@@ -25,7 +26,15 @@ import numpy as np
 
 from .reader import ArrayReader
 from .remote import _path
-from .snapshot import RepositoryLocation, S3Repository, Snapshot, SnapshotReadSession, _storage
+from .retention import RetentionPin, _retain
+from .snapshot import (
+    RepositoryLocation,
+    Snapshot,
+    SnapshotReadSession,
+    _repository,
+    _verify_storage,
+    _writable_repository,
+)
 
 
 @dataclass(frozen=True)
@@ -85,42 +94,6 @@ class PartitionGrid:
             read.append(slice(start, stop))
             core.append(slice(lo - start, hi - start))
         return Partition(number, tuple(output), tuple(read), tuple(core))
-
-
-def _verify_storage(location: RepositoryLocation) -> None:
-    if isinstance(location, S3Repository):
-        from .s3_writes import verify_s3_writes
-
-        verify_s3_writes(
-            location.store,
-            allow_http=location.allow_http,
-            force_path_style=location.force_path_style,
-        )
-
-
-def _repository(location: RepositoryLocation):
-    import icechunk as ic
-
-    return ic.Repository.open(_storage(location), authorize_virtual_chunk_access={})
-
-
-def _writable_repository(location: RepositoryLocation):
-    repo = _repository(location)
-    if isinstance(location, S3Repository):
-        from .s3_writes import UnsafeObjectStoreError
-
-        settings = repo.config.storage
-        # None inherits the S3 backend's safe defaults. An explicit False disables
-        # conditional writes even when the endpoint itself passed the capability probe.
-        if settings is not None and (
-            settings.unsafe_use_conditional_create is False
-            or settings.unsafe_use_conditional_update is False
-        ):
-            raise UnsafeObjectStoreError(
-                "Repository configuration disables conditional writes; restore safe settings "
-                "before preparing data"
-            )
-    return repo
 
 
 def _digest(value: np.ndarray) -> bytes:
@@ -215,6 +188,23 @@ class Preparation:
     def path(self) -> str:
         return f"_arrayroute/preparations/{self.job}"
 
+    @property
+    def input_pin(self) -> RetentionPin:
+        return RetentionPin(self.snapshot, self.config["input_pin"], "input")
+
+    def output_pin(self, snapshot: Snapshot) -> RetentionPin:
+        """Return the durable reference for this job's published revision.
+
+        Verifies the tag, so a caller cannot construct a valid publication handle for an
+        unrelated snapshot. Persist both pins with the dataset/job before removing its branch.
+        """
+        if snapshot.location != self.location:
+            raise ValueError("Published snapshot belongs to another repository")
+        pin = RetentionPin(snapshot, self.config["output_pin"], "output")
+        if _repository(self.location).lookup_tag(pin.tag) != snapshot.snapshot_id:
+            raise ValueError("Snapshot is not this preparation's retained publication")
+        return pin
+
     @classmethod
     def create(
         cls,
@@ -248,8 +238,10 @@ class Preparation:
         config = json.loads(
             json.dumps(
                 dict(
-                    version=1,
+                    version=2,
                     input_snapshot=snapshot.snapshot_id,
+                    input_pin=uuid.uuid4().hex,
+                    output_pin=uuid.uuid4().hex,
                     source=source,
                     output=output,
                     shape=grid.shape,
@@ -265,6 +257,7 @@ class Preparation:
         )
         attributes = json.loads(json.dumps(attributes, allow_nan=False))
         repo = _writable_repository(snapshot.location)
+        _retain(repo, RetentionPin(snapshot, config["input_pin"], "input"))
         # Reserve a new branch; never reset an existing branch or overwrite an array.
         repo.create_branch(branch, snapshot.snapshot_id)
         session = repo.writable_session(branch)
@@ -303,7 +296,7 @@ class Preparation:
             raise ValueError("Invalid preparation configuration")
         config = dict(raw)
         if (
-            config["version"] != 1
+            config["version"] != 2
             or config["operation"] != operation
             or config["parameters"] != parameters
         ):
@@ -399,8 +392,9 @@ class Preparation:
     def publish(self, *, buffer_bytes: int = 128 << 20) -> Snapshot:
         """Require all receipts and reread/hash each output core before marking complete.
 
-        Returns an immutable revision; no mutable public branch is switched. Retaining
-        this revision against garbage collection is the caller's responsibility.
+        Returns an immutable revision protected by a durable output reference. Its input
+        reference is retained too for reproducibility. The owning application explicitly
+        releases these references when neither the dataset nor its evidence needs them.
         """
         import zarr
 
@@ -425,6 +419,13 @@ class Preparation:
                     raise ValueError(f"Output digest mismatch for task {number}")
         group = zarr.open_group(session.store, path=self.path, mode="a")
         if group.attrs["state"] == "complete":
-            return Snapshot(self.location, session.snapshot_id)
-        group.attrs["state"] = "complete"
-        return Snapshot(self.location, session.commit(f"Publish verified preparation {self.job}"))
+            published = Snapshot(self.location, session.snapshot_id)
+        else:
+            group.attrs["state"] = "complete"
+            published = Snapshot(
+                self.location, session.commit(f"Publish verified preparation {self.job}")
+            )
+        # Until this succeeds, the work branch protects the completed output. A retry
+        # reuses the persisted token after a lost response or interrupted publication.
+        _retain(repo, RetentionPin(published, self.config["output_pin"], "output"))
+        return published
