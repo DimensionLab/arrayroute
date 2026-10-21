@@ -13,6 +13,7 @@ Frontier, on local machines or cloud workers.
 - Export large selections into ordinary NumPy files with bounded buffers and no partial publication.
 - Compare CPU and optional GPU lossless codecs, including transfer costs and byte verification.
 - Check reconstruction tolerances and merge error statistics across bounded, disjoint blocks.
+- Read immutable remote Zarr arrays over HTTP or S3-compatible storage with explicit resource limits.
 
 ## Install from source
 

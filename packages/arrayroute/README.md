@@ -91,6 +91,51 @@ threads each across the session's handles. Both are configurable. Other engines 
 their process-level threading policies. Metadata is bounded by handle count, not bytes;
 decoder scratch and library state remain outside the read-buffer budget.
 
+## Read remote arrays
+
+Install the optional `tensorstore` extra to read immutable Zarr v3 arrays over HTTP or
+S3-compatible storage:
+
+```python
+from arrayroute.remote import RemoteReadSession, S3Store
+
+session = RemoteReadSession(
+    S3Store("engineering-data", prefix="snapshots/revision-42", region="eu-central-1"),
+    buffer_bytes=256 << 20, concurrency=8, cache_bytes=0,
+)
+reader = session.open("case-17/velocity")
+region = reader.read((10, slice(20, 60), slice(30, 70), slice(10, 50), slice(None)))
+```
+
+For a private S3-compatible service, supply `endpoint="https://storage.example.org"`
+and its region. Credentials are resolved by TensorStore inside each worker using its
+default chain, or explicitly `credentials="environment"` or `"anonymous"`. Credential
+values are not stored in the session or its serialized state. Use least-privilege read
+access. Array handles are opened read-only; this API never creates or writes objects.
+
+`HttpStore("https://data.example.org/revision-42")` reads public/static endpoints. URLs
+with embedded credentials or query tokens are rejected; authenticated HTTP headers are
+not supported by this adapter. Prefer HTTPS; HTTP is available for explicitly trusted
+local/on-premises endpoints. These are client-side connectors, not an SSRF protection
+boundary. An application accepting endpoint configuration from others must authorize
+destinations before opening them server-side.
+
+Handles are bounded and worker-local, with one shared native cache/concurrency context.
+Use spawn for separate workers; serialization drops handles and native context. Retry
+limits must be positive on the tested TensorStore runtime. Cancellation remains between
+reads and does not interrupt an in-flight native request. Use immutable, versioned
+prefixes: cache clearing does not create a snapshot of changing objects.
+
+Sharded range reads require a server that correctly implements HTTP ranges and validators.
+The tests compare native received-byte counters with an instrumented server and verify
+that a small selection transfers less than a full shard. Those counters measure response
+bodies, not TCP/TLS overhead, and are process-wide. Actual transfer depends on codec,
+layout, endpoint behavior, caching and retries. Read-buffer budgets do not include native
+encoded-response buffers or decoder scratch.
+
+Driver contracts: [HTTP](https://google.github.io/tensorstore/kvstore/http/index.html)
+and [S3](https://google.github.io/tensorstore/kvstore/s3/index.html).
+
 ## Reproduce a storage pilot
 
 ```sh
