@@ -25,7 +25,7 @@ import numpy as np
 
 from .reader import ArrayReader
 from .remote import _path
-from .snapshot import RepositoryLocation, Snapshot, SnapshotReadSession, _storage
+from .snapshot import RepositoryLocation, S3Repository, Snapshot, SnapshotReadSession, _storage
 
 
 @dataclass(frozen=True)
@@ -87,10 +87,40 @@ class PartitionGrid:
         return Partition(number, tuple(output), tuple(read), tuple(core))
 
 
+def _verify_storage(location: RepositoryLocation) -> None:
+    if isinstance(location, S3Repository):
+        from .s3_writes import verify_s3_writes
+
+        verify_s3_writes(
+            location.store,
+            allow_http=location.allow_http,
+            force_path_style=location.force_path_style,
+        )
+
+
 def _repository(location: RepositoryLocation):
     import icechunk as ic
 
     return ic.Repository.open(_storage(location), authorize_virtual_chunk_access={})
+
+
+def _writable_repository(location: RepositoryLocation):
+    repo = _repository(location)
+    if isinstance(location, S3Repository):
+        from .s3_writes import UnsafeObjectStoreError
+
+        settings = repo.config.storage
+        # None inherits the S3 backend's safe defaults. An explicit False disables
+        # conditional writes even when the endpoint itself passed the capability probe.
+        if settings is not None and (
+            settings.unsafe_use_conditional_create is False
+            or settings.unsafe_use_conditional_update is False
+        ):
+            raise UnsafeObjectStoreError(
+                "Repository configuration disables conditional writes; restore safe settings "
+                "before preparing data"
+            )
+    return repo
 
 
 def _digest(value: np.ndarray) -> bytes:
@@ -171,6 +201,15 @@ class Preparation:
             *(tuple(config[k]) for k in ("shape", "chunks", "task_shape", "halo"))
         )
         self.snapshot = Snapshot(location, config["input_snapshot"])
+        self._writes_checked = False
+
+    def __getstate__(self) -> dict:
+        return {**vars(self), "_writes_checked": False}
+
+    def _check_writes(self) -> None:
+        if not self._writes_checked:
+            _verify_storage(self.location)
+            self._writes_checked = True
 
     @property
     def path(self) -> str:
@@ -203,6 +242,7 @@ class Preparation:
         output_dtype = np.dtype(dtype)
         if output_dtype.kind not in "biufc":
             raise ValueError("Only fixed-size numerical output dtypes are supported")
+        _verify_storage(snapshot.location)
         reader = SnapshotReadSession(snapshot).open(source)
         grid = PartitionGrid(reader.backend.spec.shape, chunks, task_shape, halo)
         config = json.loads(
@@ -224,7 +264,7 @@ class Preparation:
             )
         )
         attributes = json.loads(json.dumps(attributes, allow_nan=False))
-        repo = _repository(snapshot.location)
+        repo = _writable_repository(snapshot.location)
         # Reserve a new branch; never reset an existing branch or overwrite an array.
         repo.create_branch(branch, snapshot.snapshot_id)
         session = repo.writable_session(branch)
@@ -238,7 +278,9 @@ class Preparation:
             "receipts", shape=(grid.count, 33), chunks=(1024, 33), dtype="u1", fill_value=0
         )
         session.commit(f"Initialize preparation {job}")
-        return cls(snapshot.location, branch, job, config)
+        prepared = cls(snapshot.location, branch, job, config)
+        prepared._writes_checked = True
+        return prepared
 
     @classmethod
     def resume(
@@ -302,7 +344,8 @@ class Preparation:
         batch_tasks, buffer_bytes = index(batch_tasks), index(buffer_bytes)
         if min(batch_tasks, buffer_bytes) < 1:
             raise ValueError("Batch size and planned buffer budget must be positive")
-        repo = _repository(self.location)
+        self._check_writes()
+        repo = _writable_repository(self.location)
         pending = self.pending()
         completed = 0
         while batch := list(islice(pending, batch_tasks)):
@@ -361,7 +404,8 @@ class Preparation:
         """
         import zarr
 
-        repo = _repository(self.location)
+        self._check_writes()
+        repo = _writable_repository(self.location)
         session = repo.writable_session(self.branch)
         receipts = self._receipts(session)
         output = SnapshotReadSession(

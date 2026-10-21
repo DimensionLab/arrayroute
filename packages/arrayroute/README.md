@@ -386,3 +386,33 @@ Run `python -m arrayroute.benchmark_preparation --root NEW_DIRECTORY` for a repr
 synthetic pilot comparing commit batches and thread/spawn executors, plus a forced failure
 and restart. It retains raw timings, revision IDs, and independently checked hashes. This
 is a local experiment; it does not claim TB/PB throughput or a universal executor winner.
+
+### Check S3 write semantics before preprocessing
+
+S3 read compatibility does not establish transaction safety. `Preparation.create` now
+probes the target S3 endpoint **before opening or mutating the repository**. A resumed
+preparation checks again before its first write. Filesystem preparations retain their
+single-committer contract. There is no switch to silently disable conditional writes.
+Writes also reject repositories whose stored configuration explicitly disables conditional
+creation or updates, even when the endpoint passes. Read-only inspection remains available.
+
+The check creates one random tiny object under `<prefix>/_arrayroute_probes/`, exercises
+create-if-absent, matching/stale ETags, and four competing conditional updates, verifies
+the winning bytes, and deletes its probe. It requires get/put/delete access and uses Boto3
+from the `snapshots` extra. It is also available independently:
+
+```python
+from arrayroute.remote import S3Store
+from arrayroute.s3_writes import verify_s3_writes
+
+check = verify_s3_writes(S3Store("simulation-data", prefix="research", region="eu-west-1"))
+print(check.requests)  # labels and HTTP statuses; no credentials
+```
+
+`UnsafeObjectStoreError` means a required invariant failed. `ObjectStoreProbeError` means
+verification was unavailable, including access/connectivity or cleanup failure. Both block
+preparation. One live test found Garage 2.4.1 accepted an overwrite despite `If-None-Match: *`;
+that tested configuration was refused for transactional preparation. Read-only adapters are
+unaffected. Passing this probe is an observation, not proof of persistence, replicated
+consensus, all race conditions or multipart-upload semantics. Recheck after endpoint changes;
+the result is cached only in the current preparation object, never persisted as a certificate.
