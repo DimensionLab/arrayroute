@@ -54,6 +54,20 @@ number to its trajectory and last input frame. Its metadata scales with trajecto
 not window count, and random lookup takes logarithmic time. It does not shuffle or pad
 distributed batches; those policies belong to the training sampler.
 
+`arrayroute.permutation.Permutation(size, seed=73, epoch=4)` supplies a reproducible
+random-access order without an index array. `order[position]` returns a unique example
+number and `order.inverse(example)` returns its position. Save the algorithm identifier,
+size, seed, epoch and next position for replay. The canonical dataset order must remain
+fixed. `order.indices(start=rank, step=world_size)` partitions positions without duplicate
+padding; shard lengths can differ, so synchronized trainers must handle their tails.
+
+The implementation uses eight keyed BLAKE2b Feistel rounds and cycle walking, based on
+[Black and Rogaway's arbitrary-domain construction](https://www.cs.ucdavis.edu/~rogaway/papers/subset.pdf).
+It is a sampling primitive, not encryption, and is not a uniform draw from all possible
+permutations. Lookup latency varies with cycle walking. A resident NumPy/PyTorch index
+array has faster per-index iteration; this trades that speed for bounded memory and fast
+startup on very large datasets. No cryptographic or training-convergence claim is made.
+
 `arrayroute.cache.ByteLRU` limits retained values by caller-reported bytes and entry count.
 It is intended for worker-local caches. Python bookkeeping and references retained outside
 the cache are additional memory, and admitted values must not grow after insertion.
@@ -71,3 +85,15 @@ frames are SHA-256 checked; reports retain versions, source hashes and raw timin
 are synthetic scientific buffers, not solver output. OS caches are uncontrolled, decoded
 byte estimates are not transport measurements, and engine thread budgets must be matched
 before using the results for a controlled comparison. See the report's method metadata.
+
+Measure sampling separately from physical I/O:
+
+```sh
+python -m arrayroute.benchmark_permutation --output /tmp/arrayroute-index-benchmark
+# Add --torch to compare with PyTorch RandomSampler if PyTorch is installed.
+```
+
+The default benchmark samples 10,000 positions from million-, ten-million-, and
+trillion-entry index domains. The trillion-entry case uses ArrayRoute only. Each repeat
+runs in a fresh process; reports include raw times, RSS, versions, order hashes and source
+hashes. Peak RSS includes imported libraries, which differ between engines.

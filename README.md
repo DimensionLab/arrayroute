@@ -8,6 +8,7 @@ Frontier, on local machines or cloud workers.
 - Stream tiles within a decoded-data/output budget, or materialize a selected region.
 - Read through optional Zarr-Python, TensorStore and Zarrista backends.
 - Merge masked channel statistics and index long time-window datasets without a per-window list.
+- Shuffle epoch positions with a reproducible constant-memory permutation, including worker sharding.
 - Reproduce storage experiments with deterministic fixtures, output hashes and raw timings.
 
 ## Install from source
