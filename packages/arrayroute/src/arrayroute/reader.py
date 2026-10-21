@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator, Iterator
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -44,7 +46,7 @@ class ArrayReader:
         *,
         stats: ReadStats | None = None,
         cancelled: Callable[[], bool] | None = None,
-    ) -> Iterator[tuple[Tile, np.ndarray]]:
+    ) -> Generator[tuple[Tile, np.ndarray], None, None]:
         for tile in tiles(self.backend.spec, selection, buffer_bytes=self.buffer_bytes):
             if cancelled is not None and cancelled():
                 raise InterruptedError("Array read cancelled")
@@ -76,3 +78,54 @@ class ArrayReader:
             result[tile.destination] = value
             del value
         return result
+
+    @contextmanager
+    def prefetch(
+        self,
+        selection: Selection,
+        *,
+        stats: ReadStats | None = None,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> Iterator[Iterator[tuple[Tile, np.ndarray]]]:
+        """Overlap one ordered read with the consumer using two budgeted slots.
+
+        Each slot receives half of buffer_bytes for output plus estimated decoded
+        chunks. Backend caches/codec scratch and arrays retained by the consumer
+        beyond the current tile are additional. A chunk must fit in one slot.
+        One worker owns all backend reads; do not otherwise read that backend while
+        this context is active. Closing waits for an in-flight read: cancellation
+        prevents further reads but cannot interrupt a backend's blocking I/O.
+        Statistics include prefetched reads even if the consumer stops early.
+        The cancellation callback must be thread-safe. Release each value before
+        advancing if retaining a previous tile would exceed the consumer's budget.
+        """
+        budget = self.buffer_bytes // 2
+        if budget < 1:
+            raise ValueError("Prefetch requires a budget for two read slots")
+        reader = ArrayReader(self.backend, buffer_bytes=budget)
+        source = reader.stream(selection, stats=stats, cancelled=cancelled)
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="arrayroute-read")
+
+        def advance() -> tuple[Tile, np.ndarray] | None:
+            return next(source, None)
+
+        def ordered() -> Generator[tuple[Tile, np.ndarray], None, None]:
+            pending = executor.submit(advance)
+            while True:
+                if cancelled is not None and cancelled():
+                    raise InterruptedError("Array read cancelled")
+                current = pending.result()
+                if current is None:
+                    return
+                pending = executor.submit(advance)
+                yield current
+                del current
+
+        output = ordered()
+        try:
+            yield output
+        finally:
+            # A running generator cannot be closed until its worker has returned.
+            executor.shutdown(wait=True, cancel_futures=True)
+            output.close()
+            source.close()

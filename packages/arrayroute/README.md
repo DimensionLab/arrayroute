@@ -505,3 +505,35 @@ operation. Its cutoff must predate all in-flight writes; coordinate active write
 reclamation. These references do not authorize unsafe cutoff selection, bypassing tags,
 deleting external virtual objects, or deleting a bucket. They are not backups or expiring
 leases. ArrayRoute does not start a background destructive cleaner.
+
+## Overlap reads with processing
+
+For a synchronous consumer, `ArrayReader.prefetch()` overlaps the next tile's read
+with processing the current tile. It preserves tile order and exact values. Use a
+context so early exit, cancellation or consumer exceptions join the worker and release
+the generator. Native blocking I/O must finish before the context can close.
+
+```python
+from arrayroute.session import LocalReadSession
+
+session = LocalReadSession("tensorstore", buffer_bytes=64 << 20, immutable=True)
+reader = session.open("simulation.zarr", "velocity")
+with reader.prefetch((slice(None),) * len(reader.backend.spec.shape)) as blocks:
+    for tile, values in blocks:
+        process(tile.destination, values)
+        del values  # release the consumer reference before requesting another tile
+```
+
+The explicit budget is divided into two equal read slots, each covering returned
+values plus the decoded-chunk estimate. At least one decoded chunk must fit in a slot.
+This excludes backend caches, codec scratch, consumer processing and arrays retained
+after their iteration. One worker owns backend reads; do not concurrently use that
+backend/session elsewhere. Cancellation callbacks must be thread-safe. No unbounded task queue is created. Read statistics count
+completed prefetches even if their values are not consumed. Storage exceptions propagate
+when the consumer reaches the failed read.
+
+This is optional; storage engines already have internal concurrency, so added overlap
+may help a compute-heavy consumer or may add overhead. `python -m
+arrayroute.benchmark_prefetch --root /tmp/read-overlap` compares identical serial and
+prefetched tiles, verifies fixture hashes and every resulting stream digest/reduction,
+and records first-party Zarr/TensorStore results without a universal speed claim.
