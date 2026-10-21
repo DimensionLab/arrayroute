@@ -309,3 +309,80 @@ Snapshots add version semantics, not an automatic speedup. The portable
 with plain Zarr-Python and TensorStore, checks every frame against independent hashes, and
 records the extra storage for one changed chunk. It requires the `benchmark` extra on
 Python 3.12+, never overwrites an existing output directory, and uses synthetic values.
+
+## Prepare a revision with recoverable parallel tasks
+
+`arrayroute.preparation` uses the same `snapshots` extra. It is an experimental,
+shape-preserving numerical preprocessing API. A task owns complete output chunks; read
+halos can overlap for stencils such as gradients. A single coordinator commits completed
+output chunks and their SHA-256 receipts together. A separate work branch keeps partial
+output out of the published revision. Failed or lost tasks have no committed receipt and
+are retried after reopening the job.
+
+For a four-dimensional scalar field `(time, x, y, z)`, this computes its x derivative with
+2 m spacing. Put this in an importable Python script with a `__main__` guard for spawn:
+
+```python
+from concurrent.futures import ProcessPoolExecutor
+import multiprocessing
+import numpy as np
+from arrayroute.preparation import Preparation
+from arrayroute.snapshot import FilesystemRepository, Snapshot
+
+
+def velocity_gradient(values):
+    return np.gradient(values, 2, axis=1)
+
+
+def main():
+    source = Snapshot.resolve(FilesystemRepository("simulation.icechunk"))
+    job = Preparation.create(
+        source,
+        branch="prepare-velocity-gradient", job="velocity-gradient",
+        source="velocity_x", output="du_dx",
+        chunks=(1, 32, 32, 32), task_shape=(1, 64, 64, 64), halo=(0, 1, 0, 0),
+        dtype="float32", operation="numpy-gradient-x-v1", parameters={"spacing_m": 2},
+        attributes={"units": "1/s", "dims": ["time", "x", "y", "z"]},
+    )
+    with ProcessPoolExecutor(4, mp_context=multiprocessing.get_context("spawn")) as pool:
+        job.run(velocity_gradient, pool,
+                batch_tasks=16, buffer_bytes=128 << 20)
+    revision = job.publish()
+    print(revision.snapshot_id)  # use this immutable ID as a downstream dataset input
+
+
+if __name__ == "__main__":
+    main()
+```
+
+After interruption, use `Preparation.resume(location, branch=..., job=...,
+operation="numpy-gradient-x-v1", parameters={"spacing_m": 2})`, then `run` with the same
+operator. `pending()` streams task IDs in bounded progress blocks. `PreparationError`
+reports failed IDs and the checkpoint retaining successful tasks. `run` returns the number
+of newly completed tasks. A cancellation callback is checked between batches, without
+killing native operations mid-write. Executors and worker cleanup belong to the caller.
+Thread executors are also supported and can be faster than processes for small operations.
+
+Each operator must return the halo-expanded input shape and the declared dtype. The
+framework crops the owned core. You must choose appropriate halos, spacing, output units,
+and physical boundary treatment; this API does not infer boundary conditions. Workers
+reuse one pinned input reader per thread, with bounded handles and disabled chunk caches.
+Budget checks cover planned read buffers, transform output and write copies; custom
+operator scratch, native codec caches and total process RSS require additional headroom.
+Publication also has a `buffer_bytes` limit and rereads every output core to verify its
+receipt. Hashes verify output integrity, not the scientific correctness of the operator.
+
+**Operational contract:** one trusted coordinator per work branch and trusted operator
+code/workers. This is not an access-control boundary, sandbox, distributed lock service,
+or code fingerprinting system. Operation name/configuration are caller-supplied provenance.
+New outputs are unsharded so task ownership is unambiguous. All workers need access to the
+repository; local cooperative writes have been tested, multi-host object-store writes
+remain to be validated. Never run concurrent committers against a filesystem repository.
+A failed initialization may leave a reserved staging branch; inspect it before cleanup.
+Uncommitted failed worker chunks can remain unreachable until repository maintenance.
+The published revision still needs retention protection from the repository owner.
+
+Run `python -m arrayroute.benchmark_preparation --root NEW_DIRECTORY` for a reproducible
+synthetic pilot comparing commit batches and thread/spawn executors, plus a forced failure
+and restart. It retains raw timings, revision IDs, and independently checked hashes. This
+is a local experiment; it does not claim TB/PB throughput or a universal executor winner.
