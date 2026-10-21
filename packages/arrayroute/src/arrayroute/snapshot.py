@@ -135,6 +135,10 @@ class SnapshotReadSession:
     objects; a worker reopens the same snapshot, never the current branch. Chunk/attribute
     caches have byte budgets, metadata caches have entry budgets, and selected arrays use
     ArrayReader's buffer budget. These are not a complete process RSS bound.
+
+    Local reads use a 1 MiB range-splitting target to avoid subdividing small files.
+    Remote repositories keep the storage backend's target. range_request_bytes
+    overrides either policy without changing the persisted repository configuration.
     """
 
     def __init__(
@@ -146,6 +150,7 @@ class SnapshotReadSession:
         cache_bytes: int = 0,
         metadata_entries: int = 1024,
         concurrency: int = 8,
+        range_request_bytes: int | None = None,
     ):
         if not isinstance(snapshot, Snapshot):
             raise TypeError("Resolve and pin a Snapshot before creating a read session")
@@ -157,12 +162,17 @@ class SnapshotReadSession:
             raise ValueError(
                 "Positive buffer/handle/metadata/concurrency limits and cache >= 0 required"
             )
+        if range_request_bytes is not None:
+            range_request_bytes = index(range_request_bytes)
+            if not 0 < range_request_bytes <= (1 << 64) - 1:
+                raise ValueError("range_request_bytes must be a positive uint64 byte count")
         self.snapshot = snapshot
         self.buffer_bytes = buffer_bytes
         self.max_open_arrays = max_open_arrays
         self.cache_bytes = cache_bytes
         self.metadata_entries = metadata_entries
         self.concurrency = concurrency
+        self.range_request_bytes = range_request_bytes
         self._session: Any = None
         self._readers: OrderedDict[str, ArrayReader] = OrderedDict()
 
@@ -172,6 +182,12 @@ class SnapshotReadSession:
 
     def __getstate__(self) -> dict:
         return {**vars(self), "_session": None, "_readers": OrderedDict()}
+
+    @property
+    def effective_range_request_bytes(self) -> int | None:
+        if self.range_request_bytes is not None:
+            return self.range_request_bytes
+        return 1 << 20 if isinstance(self.snapshot.location, FilesystemRepository) else None
 
     def open(self, array_path: str) -> ArrayReader:
         import icechunk as ic
@@ -187,6 +203,15 @@ class SnapshotReadSession:
                 _storage(self.snapshot.location),
                 config=RepositoryConfig(
                     max_concurrent_requests=self.concurrency,
+                    storage=(
+                        ic.StorageSettings(
+                            concurrency=ic.StorageConcurrencySettings(
+                                ideal_concurrent_request_size=self.effective_range_request_bytes
+                            )
+                        )
+                        if self.effective_range_request_bytes is not None
+                        else None
+                    ),
                     caching=CachingConfig(
                         num_snapshot_nodes=self.metadata_entries,
                         num_chunk_refs=self.metadata_entries,

@@ -18,18 +18,23 @@ from pathlib import Path
 import numpy as np
 
 
-def worker(root: Path, mode: str, concurrency: int) -> None:
+def worker(
+    root: Path, mode: str, concurrency: int, range_request_bytes: int | None = None
+) -> None:
     from .session import LocalReadSession
     from .snapshot import FilesystemRepository, Snapshot, SnapshotReadSession
 
     fixture = json.loads((root / "fixture.json").read_text())
     start = time.perf_counter()
+    effective_range_bytes = None
     if mode == "snapshot":
         session = SnapshotReadSession(
             Snapshot(FilesystemRepository(str(root / "repository")), fixture["snapshot_id"]),
             concurrency=concurrency,
+            range_request_bytes=range_request_bytes,
         )
         reader = session.open("velocity")
+        effective_range_bytes = session.effective_range_request_bytes
     else:
         reader = LocalReadSession(mode).open(root / "plain.zarr", "velocity")
     opened = time.perf_counter() - start
@@ -52,12 +57,16 @@ def worker(root: Path, mode: str, concurrency: int) -> None:
                 "verified_frames": len(checks),
                 "verified": True,
                 "snapshot_concurrency": concurrency if mode == "snapshot" else None,
+                "range_request_bytes": range_request_bytes if mode == "snapshot" else None,
+                "effective_range_request_bytes": effective_range_bytes,
             }
         )
     )
 
 
-def experiment(root: Path, frames: int, edge: int, repeats: int, concurrency: int) -> None:
+def experiment(
+    root: Path, frames: int, edge: int, repeats: int, concurrency: int, chunk_edge: int = 32
+) -> None:
     import icechunk as ic
     import zarr
     from zarr.codecs import BloscCodec
@@ -65,7 +74,7 @@ def experiment(root: Path, frames: int, edge: int, repeats: int, concurrency: in
     root.mkdir(parents=True, exist_ok=False)
     repo = ic.Repository.create(ic.local_filesystem_storage(str(root / "repository")))
     session = repo.writable_session("main")
-    shape, chunks = (frames, edge, edge, edge, 3), (1, 32, 32, 32, 3)
+    shape, chunks = (frames, edge, edge, edge, 3), (1, chunk_edge, chunk_edge, chunk_edge, 3)
     options = {
         "shape": shape,
         "chunks": chunks,
@@ -85,7 +94,7 @@ def experiment(root: Path, frames: int, edge: int, repeats: int, concurrency: in
     first_bytes = size(root / "repository")
     change = repo.writable_session("main")
     changed = zarr.open_array(change.store, path="velocity", mode="a")
-    changed[0, :32, :32, :32, :] = 1
+    changed[0, :chunk_edge, :chunk_edge, :chunk_edge, :] = 1
     next_sid = change.commit("change one spatial chunk")
     second_bytes = size(root / "repository")
     order = list(range(frames))
@@ -150,16 +159,22 @@ def main() -> None:
     parser.add_argument("root", type=Path)
     parser.add_argument("--frames", type=int, default=8)
     parser.add_argument("--edge", type=int, default=96)
+    parser.add_argument("--chunk-edge", type=int, default=32)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--concurrency", type=int, default=8)
+    parser.add_argument("--range-request-bytes", type=int)
     parser.add_argument("--worker", choices=["zarr-python", "tensorstore", "snapshot"])
     args = parser.parse_args()
-    if min(args.frames, args.edge, args.repeats, args.concurrency) < 1:
+    if min(args.frames, args.edge, args.chunk_edge, args.repeats, args.concurrency) < 1:
         parser.error("Positive frames, edge, repeats and concurrency are required")
+    if args.range_request_bytes is not None and args.worker != "snapshot":
+        parser.error("--range-request-bytes applies to --worker snapshot")
     if args.worker:
-        worker(args.root, args.worker, args.concurrency)
+        worker(args.root, args.worker, args.concurrency, args.range_request_bytes)
     else:
-        experiment(args.root, args.frames, args.edge, args.repeats, args.concurrency)
+        experiment(
+            args.root, args.frames, args.edge, args.repeats, args.concurrency, args.chunk_edge
+        )
 
 
 if __name__ == "__main__":

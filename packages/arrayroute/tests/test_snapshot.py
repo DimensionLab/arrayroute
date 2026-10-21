@@ -91,6 +91,9 @@ def test_budget_and_sparse_selection_preserve_bits(repository):
         {"max_open_arrays": 0},
         {"metadata_entries": 0},
         {"concurrency": 0},
+        {"range_request_bytes": 0},
+        {"range_request_bytes": -1},
+        {"range_request_bytes": 1 << 64},
     ],
 )
 def test_limits_fail_before_io(kwargs):
@@ -110,6 +113,29 @@ def test_reject_untrusted_paths_and_missing_revisions(repository):
         S3Repository(S3Store("test-bucket", endpoint="http://localhost:9000"))
     remote = S3Repository(S3Store("test-bucket", credentials="environment"))
     assert pickle.loads(pickle.dumps(remote)) == remote
+
+
+def test_local_range_default_does_not_override_remote_transport_policy():
+    local = SnapshotReadSession(Snapshot(FilesystemRepository("missing"), "abc"))
+    remote = SnapshotReadSession(Snapshot(S3Repository(S3Store("test-bucket")), "abc"))
+    assert local.effective_range_request_bytes == 1 << 20
+    assert remote.effective_range_request_bytes is None
+    tuned = SnapshotReadSession(remote.snapshot, range_request_bytes=8 << 20)
+    assert tuned.effective_range_request_bytes == 8 << 20
+
+
+@pytest.mark.parametrize("range_bytes", [4096, 1 << 20, 32 << 20])
+def test_read_range_policy_preserves_revision_and_repository_settings(repository, range_bytes):
+    location, repo, values, sid = repository
+    before = repo.config
+    session = SnapshotReadSession(Snapshot(location, sid), range_request_bytes=range_bytes)
+    selection = (slice(None), slice(1, 17, 3), 5, slice(None), 0)
+    assert session.read("velocity", selection).tobytes() == values[selection].tobytes()
+    restored = pickle.loads(pickle.dumps(session))
+    assert restored.range_request_bytes == range_bytes
+    assert restored.read("velocity", selection).tobytes() == values[selection].tobytes()
+    after = ic.Repository.open(ic.local_filesystem_storage(location.path)).config
+    assert before == after
 
 
 def test_virtual_chunk_access_is_not_implicitly_authorized(tmp_path):

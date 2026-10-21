@@ -295,6 +295,14 @@ spawned worker serialization retain that ID; they do not follow a newer branch. 
 read-only. `session.attributes(path)` reads metadata from that same revision. Use one
 session per worker and multiprocessing **spawn**, not fork.
 
+Local snapshot readers use a 1 MiB target before splitting one object's read into parallel
+ranges. This reduces small-file operations; it does not enlarge the requested selection or
+read extra field values. Remote readers retain the storage backend's policy. Override with
+`SnapshotReadSession(revision, range_request_bytes=...)` when measuring another workload;
+`effective_range_request_bytes` reports the local setting or `None` for the backend policy.
+The setting is session-local, survives worker serialization, and does not modify repository
+configuration. It is separate from the decoded-buffer and cache budgets.
+
 For S3-compatible storage, use `S3Repository(S3Store(...))` from `arrayroute.snapshot`
 and `arrayroute.remote`. Credentials resolve inside each worker; descriptors contain no
 keys. Plain HTTP requires explicit opt-in. This is a trusted client adapter, not an
@@ -309,6 +317,13 @@ Snapshots add version semantics, not an automatic speedup. The portable
 with plain Zarr-Python and TensorStore, checks every frame against independent hashes, and
 records the extra storage for one changed chunk. It requires the `benchmark` extra on
 Python 3.12+, never overwrites an existing output directory, and uses synthetic values.
+
+`python -m arrayroute.benchmark_snapshot_pipelines --fixture OUTPUT --output NEW_DIRECTORY`
+compares codec batch sizes and Zarr's experimental fused pipeline using that fixture.
+It requires Zarr 3.3+, isolates each configuration in a fresh process, and verifies every
+returned frame. Configuration is global to each benchmark worker; this command does not
+change the reader library's defaults. Compare the recorded read times; open times have
+different optional-import costs. Neither experiment establishes performance at cluster scale.
 
 ## Prepare a revision with recoverable parallel tasks
 
