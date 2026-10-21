@@ -18,11 +18,15 @@ class LocalReadSession:
 
     Sessions are worker-local and not thread-safe. Handles are bounded by count, not
     metadata bytes. Decoded buffers are not retained
-    by this class. TensorStore's shared decoded-cache budget and thread limits apply
+    by this class. TensorStore's shared cache soft limit and thread limits apply
     across its handles; other engines use their own process-level threading policies.
     Input metadata must remain fixed for the session's lifetime. Call clear() after
     changing inputs. Serialized copies reopen handles in their destination process;
     use spawn, not fork, with native storage engines and multiprocessing workers.
+
+    With immutable=True, TensorStore skips data freshness checks and can reuse cached
+    chunks directly. This is a caller assertion, not a snapshot or a write lock: values
+    must remain unchanged too. clear() starts a fresh context after input changes.
 
     This adapter supports local or mounted filesystems. ArrayReader's Backend protocol
     remains the extension point for object stores and other storage systems.
@@ -36,7 +40,10 @@ class LocalReadSession:
         max_open_arrays: int = 64,
         tensorstore_cache_bytes: int = 0,
         tensorstore_threads: int = 8,
+        immutable: bool = False,
     ):
+        if not isinstance(immutable, bool):
+            raise TypeError("immutable must be a boolean")
         buffer_bytes, max_open_arrays, tensorstore_cache_bytes, tensorstore_threads = (
             index(v)
             for v in (buffer_bytes, max_open_arrays, tensorstore_cache_bytes, tensorstore_threads)
@@ -55,6 +62,7 @@ class LocalReadSession:
         self.max_open_arrays = max_open_arrays
         self.tensorstore_cache_bytes = tensorstore_cache_bytes
         self.tensorstore_threads = tensorstore_threads
+        self.immutable = immutable
         self._context: Any = None
         self._readers: OrderedDict[tuple[str, str], ArrayReader] = OrderedDict()
 
@@ -94,6 +102,7 @@ class LocalReadSession:
                         "kvstore": {"driver": "file", "path": str(Path(key[0]) / key[1]) + "/"},
                     },
                     read=True,
+                    recheck_cached_data=not self.immutable,
                     context=self._context,
                 ).result()
             )

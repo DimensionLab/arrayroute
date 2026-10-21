@@ -91,6 +91,14 @@ threads each across the session's handles. Both are configurable. Other engines 
 their process-level threading policies. Metadata is bounded by handle count, not bytes;
 decoder scratch and library state remain outside the read-buffer budget.
 
+`immutable=True` explicitly asserts that stored values also stay fixed for the session's
+lifetime. TensorStore then skips freshness checks when reusing cached chunks. It defaults
+to `False`; metadata/handle reuse alone does not opt into stale data. Call `clear()` after
+changing inputs. This flag provides neither a write lock nor a snapshot; use pinned
+snapshot sessions when a concurrent writer must be supported. The native cache size is a
+**soft** eviction limit, not a hard process-memory bound. See TensorStore's
+[cache and freshness options](https://google.github.io/tensorstore/python/api/tensorstore.TensorStore.spec.html).
+
 ## Read remote arrays
 
 Install the optional `tensorstore` extra to read immutable Zarr v3 arrays over HTTP or
