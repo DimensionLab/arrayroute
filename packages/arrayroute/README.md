@@ -72,6 +72,25 @@ startup on very large datasets. No cryptographic or training-convergence claim i
 It is intended for worker-local caches. Python bookkeeping and references retained outside
 the cache are additional memory, and admitted values must not grow after insertion.
 
+`arrayroute.session.LocalReadSession` reuses a bounded number of array handles on local
+or mounted filesystems. Choose one engine explicitly; unavailable engines fail instead
+of silently changing the implementation:
+
+```python
+from arrayroute.session import LocalReadSession
+
+session = LocalReadSession("tensorstore", buffer_bytes=256 << 20, max_open_arrays=64)
+values = session.read("/data/case.zarr", "fields/velocity", (slice(10, 14), slice(None), 2))
+```
+
+The selection must match your array's rank. Reuse a session within one worker. Input
+metadata stays fixed until `clear()`; serialized copies discard handles and native state.
+Use multiprocessing **spawn** for native engines. Sessions are not thread-safe. The shared
+TensorStore cache defaults to zero bytes; its I/O and copy concurrency default to eight
+threads each across the session's handles. Both are configurable. Other engines retain
+their process-level threading policies. Metadata is bounded by handle count, not bytes;
+decoder scratch and library state remain outside the read-buffer budget.
+
 ## Reproduce a storage pilot
 
 ```sh
