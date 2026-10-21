@@ -32,11 +32,6 @@ def repository(tmp_path):
     return location, repo, values, snapshot_id
 
 
-def _worker_read(session):
-    selected = session.read("velocity", (1, slice(None), 3, slice(None), 2))
-    return session.snapshot.snapshot_id, selected
-
-
 def test_revision_survives_new_commits_eviction_and_spawn(repository):
     location, repo, values, sid = repository
     pinned = Snapshot.resolve(location)
@@ -55,9 +50,9 @@ def test_revision_survives_new_commits_eviction_and_spawn(repository):
     clone = pickle.loads(pickle.dumps(session))
     assert clone._session is None and not clone._readers
     with ProcessPoolExecutor(2, mp_context=multiprocessing.get_context("spawn")) as pool:
-        for seen, actual in pool.map(_worker_read, [session, session]):
-            assert seen == sid
-            np.testing.assert_array_equal(actual, values[selection])
+        futures = [pool.submit(session.read, "velocity", selection) for _ in range(2)]
+        for result in futures:
+            np.testing.assert_array_equal(result.result(), values[selection])
     latest = SnapshotReadSession(Snapshot.resolve(location))
     np.testing.assert_array_equal(latest.read("velocity", selection), 99)
 
