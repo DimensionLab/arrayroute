@@ -150,6 +150,24 @@ are synthetic scientific buffers, not solver output. OS caches are uncontrolled,
 byte estimates are not transport measurements, and engine thread budgets must be matched
 before using the results for a controlled comparison. See the report's method metadata.
 
+The generator saves `materialization.json` before counting physical files. For very
+large fixtures, numerical verification can proceed independently of that inventory:
+
+```sh
+python -m arrayroute.benchmark_materialized --root /tmp/arrayroute-pilot \
+  --output /tmp/arrayroute-independent-scan --engine tensorstore
+```
+
+This command is specific to the synthetic generator above. It validates the completed
+write progress and array shape, then regenerates each frame from its seed and checks
+the stored bytes. It retains per-frame expected/actual hashes, read times, generation
+times and hashing times separately, with a constant-state traversal permutation.
+`--limit` creates an explicitly partial pilot; `--deadline` stops between frames at
+the supplied Unix timestamp. A partial or failed scan never reports full verification.
+An existing output directory is refused. Keep the source immutable and suspend competing
+I/O for comparative measurements; the command does not stop other processes or control
+the OS cache. Its memory policy covers two frame arrays, not native decoder scratch.
+
 To scan a **completed** fixture with multiple independent reader processes:
 
 ```sh

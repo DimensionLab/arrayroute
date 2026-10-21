@@ -97,6 +97,8 @@ def create_fixture(root: Path, *, frames: int, edge: int, writer: str = "zarr-py
         "concurrent_layout_writers": 3,
         "layouts": {},
     }
+    # Numeric verification must not wait for a multi-million-object inventory.
+    (root / "materialization.json").write_text(json.dumps(receipt, indent=2))
     for name, array in arrays.items():
         file_count, file_bytes, allocated_bytes = 0, 0, 0
         for directory, _, names in os.walk(root / f"{name}.zarr"):
