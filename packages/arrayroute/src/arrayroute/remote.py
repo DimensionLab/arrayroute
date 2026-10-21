@@ -162,6 +162,7 @@ class RemoteReadSession:
             {"driver": "zarr3", "kvstore": self.store.spec(path)},
             read=True,
             write=False,
+            recheck_cached_data=False,
             context=self._context,
         ).result()
         reader = ArrayReader(TensorStoreBackend(array), buffer_bytes=self.buffer_bytes)

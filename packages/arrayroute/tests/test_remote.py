@@ -43,6 +43,10 @@ def object_server(tmp_path):
                 return
             etag = '"' + hashlib.sha256(data).hexdigest() + '"'
             if self.headers.get("If-None-Match") == etag:
+                requests.append({
+                    "key": key, "range": self.headers.get("Range"), "bytes": 0,
+                    "signed": self.headers.get("Authorization", "").startswith("AWS4-HMAC-SHA256 "),
+                })
                 self.send_response(304)
                 self.send_header("ETag", etag)
                 self.end_headers()
@@ -148,6 +152,33 @@ def test_remote_range_reads_are_exact_and_do_not_download_the_whole_shard(
     with pytest.raises(ValueError, match="NOT_FOUND|not exist|Not found"):
         session.open("missing")
     assert not session._readers
+
+
+@pytest.mark.parametrize("protocol", ["http", "s3"])
+@pytest.mark.parametrize("cache_bytes", [0, 16 << 20])
+def test_fixed_remote_data_cache_avoids_repeat_requests(
+    object_server, monkeypatch, protocol, cache_bytes
+):
+    url, values, requests, _ = object_server
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test-access")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test-secret")
+    store = HttpStore(url + "/data") if protocol == "http" else S3Store(
+        "test-bucket", prefix="data", endpoint=url, region="us-east-1", credentials="environment"
+    )
+    session = RemoteReadSession(store, cache_bytes=cache_bytes)
+    selection = (1, slice(0, 16), slice(0, 16), slice(0, 16))
+    np.testing.assert_array_equal(session.read("velocity", selection), values[selection])
+    first = len(requests)
+    assert first > 0
+    for _ in range(4):
+        np.testing.assert_array_equal(session.read("velocity", selection), values[selection])
+    if cache_bytes:
+        assert len(requests) == first
+    else:
+        assert len(requests) > first
+    session.clear()
+    np.testing.assert_array_equal(session.read("velocity", selection), values[selection])
+    assert len(requests) > first
 
 
 @pytest.mark.parametrize(

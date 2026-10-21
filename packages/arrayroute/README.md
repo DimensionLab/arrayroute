@@ -129,6 +129,9 @@ boundary. An application accepting endpoint configuration from others must autho
 destinations before opening them server-side.
 
 Handles are bounded and worker-local, with one shared native cache/concurrency context.
+These remote sessions require immutable source objects. With a nonzero cache soft limit,
+repeated cached data reads skip freshness validation requests. `clear()` drops the cache;
+this is not a consistency mechanism for a concurrently changing prefix.
 Use spawn for separate workers; serialization drops handles and native context. Retry
 limits must be positive on the tested TensorStore runtime. Cancellation remains between
 reads and does not interrupt an in-flight native request. Use immutable, versioned
