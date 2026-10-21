@@ -10,6 +10,8 @@ Frontier, on local machines or cloud workers.
 - Merge masked channel statistics and index long time-window datasets without a per-window list.
 - Shuffle epoch positions with a reproducible constant-memory permutation, including worker sharding.
 - Reproduce storage experiments with deterministic fixtures, output hashes and raw timings.
+- Export large selections into ordinary NumPy files with bounded buffers and no partial publication.
+- Compare CPU and optional GPU lossless codecs, including transfer costs and byte verification.
 
 ## Install from source
 

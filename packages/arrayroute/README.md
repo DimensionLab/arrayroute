@@ -116,3 +116,42 @@ The default benchmark samples 10,000 positions from million-, ten-million-, and
 trillion-entry index domains. The trillion-entry case uses ArrayRoute only. Each repeat
 runs in a fresh process; reports include raw times, RSS, versions, order hashes and source
 hashes. Peak RSS includes imported libraries, which differ between engines.
+
+Compare lossless compression on synthetic float fields, phase masks, mesh connectivity
+and incompressible random bits:
+
+```sh
+python -m pip install './packages/arrayroute[codecs]'
+python -m arrayroute.benchmark_codecs --output /tmp/arrayroute-codecs
+# On a compatible NVIDIA CUDA 12 host, install [gpu-codecs] and include GPU candidates:
+python -m arrayroute.benchmark_codecs --output /tmp/arrayroute-gpu-codecs \
+  --codecs blosc-lz4-bitshuffle blosc-zstd-bitshuffle gpu-lz4-bitshuffle gpu-bitcomp
+```
+
+Each combination runs in a fresh process, warms up once, then measures repeated
+encode/decode operations. GPU reports separate device-resident time from host-to-host
+time including transfers. Every reconstruction is compared byte-for-byte. These are
+codec experiments without disk/network timing; random bits are an incompressibility
+control. Analytic fields are not simulated CFD. CUDA dependencies are optional and
+subject to their upstream platform and licensing requirements.
+
+## Export a selection larger than RAM
+
+```python
+from arrayroute.export import save_npy
+
+save_npy(reader, selection, "velocity-region.npy", max_output_bytes=8 << 30)
+```
+
+This writes an ordinary `.npy` file through bounded tiles, preserving dtype, shape,
+endianness and numerical bytes. The explicit output limit prevents accidentally
+exporting a much larger region. A temporary file is published only after a successful
+write; existing files and symlinks are never replaced. Cancellation and errors remove
+the temporary file. Publication requires same-directory hard links; unsupported
+filesystems fail. Abrupt process termination can leave a hidden `.partial` file.
+
+Explicit buffers use the reader's budget plus a configurable 1 MiB write buffer; backend
+scratch and OS page caches are additional. No whole-output memory map or materialization
+is used. NPY stores numerical metadata, not physical units or provenance; retain your
+scientific manifest alongside the export. The API accepts `stats` and a `cancelled`
+callback like the streaming reader.
