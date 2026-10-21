@@ -274,3 +274,38 @@ size, temporary codec memory or transport bytes. This is a configurable balanced
 not an automatically optimal layout. Full-volume training, sparse regions, object stores
 and local filesystems can favor different choices. The policy neither converts values nor
 selects a compressor; lossless versus lossy encoding remains explicit.
+
+## Pin reads to a dataset revision
+
+Install `arrayroute[snapshots]` on **Python 3.12 or newer** for the optional Icechunk 2.3
+adapter. The base package still supports Python 3.11; the snapshot extra does not install
+Icechunk there. Resolve a branch once before dispatching training/preprocessing workers:
+
+```python
+from arrayroute.snapshot import FilesystemRepository, Snapshot, SnapshotReadSession
+
+revision = Snapshot.resolve(FilesystemRepository("simulation.icechunk"), branch="main")
+print(revision.snapshot_id)  # save this in the job's input manifest
+session = SnapshotReadSession(revision, buffer_bytes=64 << 20, max_open_arrays=16)
+velocity = session.read("velocity", (10, slice(20, 40), slice(None), slice(None), slice(None)))
+```
+
+`Snapshot(location, saved_id)` reopens a known revision. Cache eviction, `clear()` and
+spawned worker serialization retain that ID; they do not follow a newer branch. Reads are
+read-only. `session.attributes(path)` reads metadata from that same revision. Use one
+session per worker and multiprocessing **spawn**, not fork.
+
+For S3-compatible storage, use `S3Repository(S3Store(...))` from `arrayroute.snapshot`
+and `arrayroute.remote`. Credentials resolve inside each worker; descriptors contain no
+keys. Plain HTTP requires explicit opt-in. This is a trusted client adapter, not an
+endpoint authorization boundary. External virtual chunks are denied: repository snapshots
+do not make mutable external objects immutable. The repository owner must retain the
+referenced revision; this adapter does not provide backup, reader leases or garbage
+collection protection. Icechunk's local filesystem backend must not have concurrent
+committers; use an object store with the required conditional operations for that workflow.
+
+Snapshots add version semantics, not an automatic speedup. The portable
+`python -m arrayroute.benchmark_snapshots OUTPUT` experiment compares fresh-process reads
+with plain Zarr-Python and TensorStore, checks every frame against independent hashes, and
+records the extra storage for one changed chunk. It requires the `benchmark` extra on
+Python 3.12+, never overwrites an existing output directory, and uses synthetic values.
