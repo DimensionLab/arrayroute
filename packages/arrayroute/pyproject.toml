@@ -1,0 +1,19 @@
+[project]
+name = "arrayroute"
+version = "0.1.0"
+description = "Measured, bounded selections over scientific chunked arrays"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+readme = "README.md"
+dependencies = ["numpy>=1.26"]
+
+[project.optional-dependencies]
+zarr = ["zarr>=3.1"]
+tensorstore = ["tensorstore>=0.1.76"]
+zarrista = ["zarrista>=0.1,<0.2"]
+benchmark = ["zarr>=3.1", "tensorstore>=0.1.76", "zarrista>=0.1,<0.2"]
+test = ["pytest>=8", "zarr>=3.1"]
+
+[build-system]
+requires = ["uv_build>=0.8.9,<0.9.0"]
+build-backend = "uv_build"
