@@ -105,6 +105,25 @@ are synthetic scientific buffers, not solver output. OS caches are uncontrolled,
 byte estimates are not transport measurements, and engine thread budgets must be matched
 before using the results for a controlled comparison. See the report's method metadata.
 
+To scan a **completed** fixture with multiple independent reader processes:
+
+```sh
+python -m arrayroute.benchmark_parallel --root /tmp/arrayroute-pilot \
+  --output /tmp/arrayroute-scan-2-workers --engine tensorstore \
+  --workers 2 --threads-per-worker 2
+```
+
+The output directory must be new. Spawned processes read disjoint positions in one
+reproducible permutation, without padding or a shuffled index array. Every source frame
+is checked against the fixture's SHA-256 manifest. A failed worker cancels its peers
+between reads and prevents publication of a success report; partial per-frame logs remain.
+The aggregate logical throughput includes startup, metadata, reads, checking and log writes.
+It does not measure physical network bytes or claim multi-host scaling. Each worker owns
+its buffer budget; hash copies, backend scratch, caches and engine threads are additional.
+TensorStore copy/I/O limits apply per worker; set other engines' process-level thread
+policies explicitly. Keep the fixture immutable and record CPU quotas and cache conditions
+when comparing worker counts. The hash manifest itself occupies memory per process.
+
 Measure sampling separately from physical I/O:
 
 ```sh
