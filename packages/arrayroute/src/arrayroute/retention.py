@@ -25,6 +25,14 @@ _PREFIX = "arrayroute-retain-v1-"
 _PURPOSES = {"input", "output", "training", "report", "reader"}
 
 
+def _require_v2(repo):
+    import icechunk as ic
+
+    if repo.spec_version != ic.SpecVersion.v2:
+        raise ValueError("Durable consumer references require an Icechunk v2 repository")
+    return repo
+
+
 class ReleasedPinError(ValueError):
     """A released retention token cannot be reused; allocate a new consumer token."""
 
@@ -51,6 +59,7 @@ class RetentionPin:
 def _retain(repo, pin: RetentionPin) -> None:
     import icechunk as ic
 
+    _require_v2(repo)
     try:
         repo.create_tag(pin.tag, pin.snapshot.snapshot_id)
     except ic.AlreadyExistsError:
@@ -85,7 +94,7 @@ class RetentionManager:
         if not self._writes_checked:
             _verify_storage(self.location)
             self._writes_checked = True
-        return _writable_repository(self.location)
+        return _require_v2(_writable_repository(self.location))
 
     def retain(self, snapshot: Snapshot, *, purpose: str, token: str | None = None) -> RetentionPin:
         if snapshot.location != self.location:
@@ -97,7 +106,8 @@ class RetentionManager:
     def verify(self, pin: RetentionPin) -> None:
         if pin.snapshot.location != self.location:
             raise ValueError("Pin belongs to another repository")
-        if _repository(self.location).lookup_tag(pin.tag) != pin.snapshot.snapshot_id:
+        repo = _require_v2(_repository(self.location))
+        if repo.lookup_tag(pin.tag) != pin.snapshot.snapshot_id:
             raise ValueError("Retention reference does not match the requested revision")
 
     def release(self, pin: RetentionPin) -> bool:
@@ -127,7 +137,7 @@ class RetentionManager:
         """
         import icechunk as ic
 
-        repo = _repository(self.location)
+        repo = _require_v2(_repository(self.location))
         for tag in sorted(repo.list_tags()):
             if not tag.startswith(_PREFIX):
                 continue

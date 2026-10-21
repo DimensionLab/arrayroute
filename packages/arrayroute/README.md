@@ -422,7 +422,8 @@ the result is cached only in the current preparation object, never persisted as 
 ### Keep revisions available to jobs and reports
 
 An immutable snapshot ID alone does not prevent cleanup. Retention references protect
-the exact snapshot and its reachable chunks using Icechunk tags:
+the exact snapshot and its reachable chunks using Icechunk v2 tags. Older v1 repositories
+remain readable, but must be migrated with the engine's tools before using retention:
 
 ```python
 from arrayroute.retention import RetentionManager

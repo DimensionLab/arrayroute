@@ -177,3 +177,15 @@ def test_lost_publication_tag_response_can_resume(data, monkeypatch):
     )
     result = resumed.publish()
     RetentionManager(original.location).verify(resumed.output_pin(result))
+
+
+def test_legacy_repository_is_readable_but_cannot_claim_v2_retention(tmp_path):
+    location = FilesystemRepository(str(tmp_path / "legacy"))
+    repo = ic.Repository.create(ic.local_filesystem_storage(location.path), spec_version=1)
+    session = repo.writable_session("main")
+    zarr.group(session.store).create_array("u", data=np.arange(8, dtype="f4"), chunks=(4,))
+    snapshot = Snapshot(location, session.commit("legacy fixture"))
+    assert SnapshotReadSession(snapshot).read("u", (slice(None),)).shape == (8,)
+    with pytest.raises(ValueError, match="v2 repository"):
+        RetentionManager(location).retain(snapshot, purpose="reader")
+    assert not repo.list_tags()
