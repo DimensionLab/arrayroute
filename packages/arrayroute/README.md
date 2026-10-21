@@ -155,3 +155,26 @@ scratch and OS page caches are additional. No whole-output memory map or materia
 is used. NPY stores numerical metadata, not physical units or provenance; retain your
 scientific manifest alongside the export. The API accepts `stats` and a `cancelled`
 callback like the streaming reader.
+
+## Validate reconstruction accuracy
+
+```python
+from arrayroute.quality import ErrorAccumulator
+
+errors = ErrorAccumulator(absolute_tolerance=0.001)  # same units as the source field
+for reference_block, decoded_block in paired_blocks:
+    errors.update(reference_block, decoded_block)
+print(errors.result.passed, errors.result.max_absolute_error, errors.result.relative_l2)
+```
+
+This independently checks the requested absolute tolerance without percentage slack.
+Shapes/dtypes and nonfinite positions must agree; NaN payloads and signed zero are not
+byte-preservation requirements in this numerical assessment. For lossless storage use
+byte comparisons or hashes as well. Measurements use float64, not interval arithmetic.
+Overflow in error measurement raises an error. Relative L2 is `None` when undefined or
+unrepresentable; counts expose empty/all-nonfinite regions.
+
+Accumulators retain statistics, not input arrays. Workers can merge assessments computed
+with the same tolerance over disjoint blocks. Comparison scratch is proportional to the
+supplied block, so keep blocks bounded. This checks field reconstruction only; accuracy
+of gradients, integrals, spectra or other derived quantities needs its own assessment.

@@ -12,6 +12,7 @@ Frontier, on local machines or cloud workers.
 - Reproduce storage experiments with deterministic fixtures, output hashes and raw timings.
 - Export large selections into ordinary NumPy files with bounded buffers and no partial publication.
 - Compare CPU and optional GPU lossless codecs, including transfer costs and byte verification.
+- Check reconstruction tolerances and merge error statistics across bounded, disjoint blocks.
 
 ## Install from source
 
