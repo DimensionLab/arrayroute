@@ -24,6 +24,7 @@ from .reader import Backend
 
 _MAGIC = b"ARTILE01"
 _HEADER = len(_MAGIC) + 32
+_ADMISSION_HEADROOM = 64 << 10
 
 
 def _digest(key: str, payload: bytes | memoryview) -> bytes:
@@ -138,10 +139,13 @@ class TileCacheStats:
     source_bytes: int = 0
     coalesced_hits: int = 0
     fill_wait_seconds: float = 0.0
+    writes: int = 0
+    write_bytes: int = 0
+    admission_rejections: int = 0
 
 
 class TileCache:
-    """Process-shared LRU cache on local disk, never NFS or object storage.
+    """Process-shared cache on local disk, never NFS or object storage.
 
     The size limit is DiskCache's approximate database-plus-payload volume after cull.
     WAL, filesystem bookkeeping, concurrent writes and temporary files are additional;
@@ -152,10 +156,16 @@ class TileCache:
     recheck the cache after the active fill, avoiding duplicate source reads while
     the entry remains retained. Unrelated keys on the same stripe can briefly wait.
     The OS releases a crashed process's hard lock; waits have an explicit timeout.
+    admission='retain' preserves admitted tiles and declines new fills when full,
+    avoiding epoch-wide LRU churn. Admission is serialized across processes after
+    source reads finish; hits remain read-only. The first successful fills win, so
+    concurrent scheduling can change the retained subset, never the returned values.
     """
 
     def __init__(self, directory: str | Path, *, capacity_bytes: int, max_entry_bytes: int,
-                 fill_timeout_seconds: float = 60):
+                 fill_timeout_seconds: float = 60, admission: str = 'lru'):
+        if admission not in {'lru', 'retain'}:
+            raise ValueError('Cache admission must be lru or retain')
         if any(isinstance(v, bool) for v in (capacity_bytes, max_entry_bytes)):
             raise ValueError("Cache limits must be positive integers")
         capacity_bytes, max_entry_bytes = index(capacity_bytes), index(max_entry_bytes)
@@ -170,10 +180,12 @@ class TileCache:
         self.capacity_bytes = capacity_bytes
         self.max_entry_bytes = max_entry_bytes
         self.fill_timeout_seconds = fill_timeout_seconds
+        self.admission = admission
         root = Path(self.directory)
         root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        policy = json.dumps({"schema": 2, "capacity_bytes": capacity_bytes,
-                             "max_entry_bytes": max_entry_bytes}, sort_keys=True).encode()
+        policy = json.dumps({"schema": 3, "capacity_bytes": capacity_bytes,
+                             "max_entry_bytes": max_entry_bytes,
+                             "admission": admission}, sort_keys=True).encode()
         fd, temporary = tempfile.mkstemp(prefix="policy-", dir=root)
         try:
             with os.fdopen(fd, "wb") as stream:
@@ -190,8 +202,9 @@ class TileCache:
             os.unlink(temporary)
         self._cache = Cache(
             str(root / "data"), disk=_BytesDisk, timeout=30,
-            size_limit=capacity_bytes, eviction_policy="least-recently-used",
-            cull_limit=1,
+            size_limit=capacity_bytes,
+            eviction_policy="least-recently-used" if admission == 'lru' else 'none',
+            cull_limit=1 if admission == 'lru' else 0,
             disk_min_file_size=0, disk_max_payload_bytes=max_entry_bytes + _HEADER,
         )
         (root / "locks").mkdir(exist_ok=True, mode=0o700)
@@ -199,7 +212,8 @@ class TileCache:
     def __getstate__(self):
         return {"directory": self.directory, "capacity_bytes": self.capacity_bytes,
                 "max_entry_bytes": self.max_entry_bytes,
-                "fill_timeout_seconds": self.fill_timeout_seconds}
+                "fill_timeout_seconds": self.fill_timeout_seconds,
+                "admission": self.admission}
 
     def __setstate__(self, state):
         self.__init__(**state)
@@ -212,6 +226,22 @@ class TileCache:
 
     def backend(self, source: Backend, identity: ArrayIdentity) -> CachedBackend:
         return CachedBackend(source, self, identity)
+
+    def _store(self, key: str, value: np.ndarray) -> tuple[bool, int]:
+        size = value.nbytes + _HEADER
+        if self.admission == 'lru':
+            self._cache.set(key, _TilePayload(key, value), read=True)
+            self._cache.cull()
+            return True, size
+        # Serialize check and publication, not upstream reads, across worker processes.
+        with self._cache.transact(retry=False):
+            if self.volume() + size + _ADMISSION_HEADROOM > self.capacity_bytes:
+                return False, 0
+            self._cache.set(key, _TilePayload(key, value), read=True)
+            if self.volume() > self.capacity_bytes:
+                self._cache.delete(key)
+                return False, size
+        return True, size
 
     def _fill_lock(self, key: str):
         return FileLock(Path(self.directory) / "locks" / f"{key[:2]}.lock",
@@ -301,6 +331,8 @@ class CachedBackend:
             raise ValueError("Source returned an unexpected tile shape or dtype")
         self.stats.source_bytes += value.nbytes
         if cache_value:
-            self.cache._cache.set(key, _TilePayload(key, value), read=True)
-            self.cache._cache.cull()
+            admitted, written = self.cache._store(key, value)
+            self.stats.writes += int(written > 0)
+            self.stats.write_bytes += written
+            self.stats.admission_rejections += int(not admitted)
         return value

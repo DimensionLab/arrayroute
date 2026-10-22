@@ -299,9 +299,114 @@ def test_cache_metadata_cannot_delete_an_external_file(tmp_path):
     cache.close()
 
 
+def test_retain_preserves_subset_across_epochs_and_restart(tmp_path):
+    values = np.arange(8*512*512, dtype='f4').reshape(8, 512, 512)
+    source = Source(values)
+    cache = TileCache(tmp_path, capacity_bytes=4 << 20, max_entry_bytes=1 << 20,
+                      admission='retain')
+    backend = cache.backend(source, identity())
+    for _ in range(3):
+        for frame in range(8):
+            np.testing.assert_array_equal(backend.read((frame, slice(None), slice(None))),
+                                          values[frame])
+            assert cache.volume() <= cache.capacity_bytes
+    assert backend.stats.hits == 6 and backend.stats.misses == 18
+    assert backend.stats.writes == 3 and backend.stats.admission_rejections == 15
+    assert backend.stats.write_bytes == 3*((1 << 20)+40)
+    assert source.calls == 18
+    clone = pickle.loads(pickle.dumps(cache))
+    cache.close()
+    source.fail = True
+    np.testing.assert_array_equal(
+        clone.backend(source, identity()).read((0, slice(None), slice(None))), values[0])
+    assert clone.admission == 'retain'
+    with pytest.raises(ValueError, match='different'):
+        open_cache(tmp_path)
+    clone.close()
+
+
+def _retain_worker(args):
+    path, frame = args
+    values = np.full((512, 512), frame, dtype='f4')
+    cache = TileCache(path, capacity_bytes=4 << 20, max_entry_bytes=1 << 20,
+                      admission='retain')
+    backend = cache.backend(Source(values), identity(source=f'frame-{frame}'))
+    result = backend.read((slice(None), slice(None)))
+    assert result.tobytes() == values.tobytes()
+    report = dict(writes=backend.stats.writes, rejected=backend.stats.admission_rejections,
+                  volume=cache.volume())
+    cache.close()
+    return report
+
+
+def test_retain_admission_serializes_different_keys_across_processes(tmp_path):
+    cache = TileCache(tmp_path, capacity_bytes=4 << 20, max_entry_bytes=1 << 20,
+                      admission='retain')
+
+    def run(frame):
+        result = subprocess.run([sys.executable, __file__, '--retain-worker',
+                                 json.dumps([str(tmp_path), frame])],
+                                capture_output=True, text=True, check=True, timeout=30)
+        return json.loads(result.stdout)
+
+    with ThreadPoolExecutor(4) as pool:
+        rows = list(pool.map(run, range(8)))
+    assert sum(r['writes'] for r in rows) == 3
+    assert sum(r['rejected'] for r in rows) == 5
+    assert all(r['volume'] <= cache.capacity_bytes for r in rows)
+    assert len(cache._cache) == 3 and cache._cache.check() == []
+    cache.close()
+
+
+def test_retain_full_cache_never_serializes_rejected_values(tmp_path, monkeypatch):
+    import arrayroute.disk_cache as module
+
+    source = Source(np.zeros((4, 512, 512), dtype='f4'))
+    cache = TileCache(tmp_path, capacity_bytes=4 << 20, max_entry_bytes=1 << 20,
+                      admission='retain')
+    backend = cache.backend(source, identity())
+    for i in range(3):
+        backend.read((i, slice(None), slice(None)))
+    monkeypatch.setattr(module, '_TilePayload', lambda *a: pytest.fail('rejected tile serialized'))
+    result = backend.read((3, slice(None), slice(None)))
+    assert result.nbytes == 1 << 20 and backend.stats.admission_rejections == 1
+    cache.close()
+
+
+def test_retain_discards_only_new_entry_if_database_growth_exceeds_allowance(tmp_path,
+                                                                          monkeypatch):
+    source = Source(np.zeros((3, 512, 512), dtype='f4'))
+    cache = TileCache(tmp_path, capacity_bytes=4 << 20, max_entry_bytes=1 << 20,
+                      admission='retain')
+    backend = cache.backend(source, identity())
+    backend.read((0, slice(None), slice(None)))
+    retained = set(cache._cache)
+    actual_volume = cache.volume
+    calls = []
+
+    def volume():
+        calls.append(1)
+        return actual_volume() if len(calls) == 1 else cache.capacity_bytes+1
+
+    monkeypatch.setattr(cache, 'volume', volume)
+    backend.read((1, slice(None), slice(None)))
+    assert set(cache._cache) == retained
+    assert backend.stats.writes == 2 and backend.stats.admission_rejections == 1
+    cache.close()
+
+
+@pytest.mark.parametrize('admission', ['', 'fifo', None, True])
+def test_invalid_admission_policy(tmp_path, admission):
+    with pytest.raises(ValueError, match='admission'):
+        TileCache(tmp_path, capacity_bytes=4 << 20, max_entry_bytes=1 << 20,
+                  admission=admission)
+
+
 if __name__ == "__main__":
     if sys.argv[1] == "--cache-worker":
         print(json.dumps(_process_read(json.loads(sys.argv[2]))))
+    elif sys.argv[1] == '--retain-worker':
+        print(json.dumps(_retain_worker(json.loads(sys.argv[2]))))
     else:
         assert sys.argv[1] == "--hold-lock"
         path, key, ready = json.loads(sys.argv[2])

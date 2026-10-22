@@ -154,12 +154,15 @@ def test_remote_range_reads_are_exact_and_do_not_download_the_whole_shard(
     assert not session._readers
 
 
-def test_revision_disk_cache_reuses_remote_tiles_after_reader_restart(object_server, tmp_path):
+@pytest.mark.parametrize('admission', ['lru', 'retain'])
+def test_revision_disk_cache_reuses_remote_tiles_after_reader_restart(object_server, tmp_path,
+                                                                    admission):
     from arrayroute.disk_cache import ArrayIdentity, TileCache
     from arrayroute.reader import ArrayReader
 
     url, values, requests, _ = object_server
-    cache = TileCache(tmp_path, capacity_bytes=4 << 20, max_entry_bytes=1 << 20)
+    cache = TileCache(tmp_path, capacity_bytes=4 << 20, max_entry_bytes=1 << 20,
+                      admission=admission)
     source = RemoteReadSession(HttpStore(url + "/data"))
     identity = ArrayIdentity("dataset/velocity", "snapshot-1", "raw-SI-v1")
     selection = (1, slice(0, 16), slice(0, 16), slice(0, 16))
@@ -168,7 +171,8 @@ def test_revision_disk_cache_reuses_remote_tiles_after_reader_restart(object_ser
     assert any("/c/" in r["key"] for r in requests)
     source.clear()
     cache.close()
-    reopened = TileCache(tmp_path, capacity_bytes=4 << 20, max_entry_bytes=1 << 20)
+    reopened = TileCache(tmp_path, capacity_bytes=4 << 20, max_entry_bytes=1 << 20,
+                         admission=admission)
     backend = reopened.backend(source.open("velocity").backend, identity)
     # Opening the array still checks its metadata; a hit eliminates only tile reads.
     before = len(requests)
@@ -181,11 +185,14 @@ def test_revision_disk_cache_reuses_remote_tiles_after_reader_restart(object_ser
     reopened.close()
 
 
-def test_remote_session_disk_cache_identity_paths_and_serialization(object_server, tmp_path):
+@pytest.mark.parametrize('admission', ['lru', 'retain'])
+def test_remote_session_disk_cache_identity_paths_and_serialization(object_server, tmp_path,
+                                                                  admission):
     from arrayroute.disk_cache import ArrayIdentity, TileCache
 
     url, values, requests, _ = object_server
-    cache = TileCache(tmp_path, capacity_bytes=4 << 20, max_entry_bytes=1 << 20)
+    cache = TileCache(tmp_path, capacity_bytes=4 << 20, max_entry_bytes=1 << 20,
+                      admission=admission)
     identity = ArrayIdentity("dataset", "revision-1", "raw-v1")
     source = RemoteReadSession(HttpStore(url + "/data"), tile_cache=cache,
                                cache_identity=identity)

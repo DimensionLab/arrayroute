@@ -888,9 +888,9 @@ The 256 persistent lock stripes bound bookkeeping; unrelated keys on the same st
 can wait for each other. A crashed worker releases its OS lock. Waiting longer than
 `fill_timeout_seconds` raises `filelock.Timeout` rather than issuing another source read.
 Only local filesystems with OS hard-lock support are supported; soft-lock fallback is
-disabled. All workers must agree on cache size policy and schema. Schema 2 separates
-coordinated writers from older cache directories: choose a new directory when upgrading
-from schema 1. Serialized cache/session objects reopen in spawned workers.
+disabled. All workers must agree on cache size, admission policy and schema. Schema 3
+records admission behavior; choose a new cache directory when upgrading from schemas
+1 or 2. Serialized cache/session objects reopen in spawned workers.
 
 Capacity is DiskCache's approximate database-plus-payload volume after eviction.
 WAL, filesystem bookkeeping, concurrent writes and temporary files are additional;
@@ -904,6 +904,31 @@ array can still fetch its metadata even when all requested tiles are cached.
 `coalesced_hits` counts hits found after entering the fill lock, and
 `fill_wait_seconds` measures successful fill-lock acquisition time. Keep one backend
 per worker; do not wrap a cached backend in another cache.
+
+### Retaining tiles across epochs larger than the cache
+
+`TileCache(..., admission="retain")` keeps successful fills instead of evicting them
+to admit later tiles. With a fixed repeated scan larger than the cache, this avoids
+rewriting the cache on every epoch. The default `admission="lru"` remains useful when
+the active subset changes. Compare against uncached reads too: local persistence can
+cost more than another read from a fast source.
+
+Retain admission checks the estimated database-plus-payload volume under a cross-process
+database transaction, after the upstream read finishes. It reserves 64 KiB of metadata
+headroom and rejects a new entry if database growth still exceeds the allowance.
+It never removes another retained entry to make room. A known-full cache declines
+admission before serializing or hashing the rejected tile. Healthy hits do not update
+LRU metadata. Quotas still exclude WAL, temporary files and filesystem overhead.
+
+The first successful fills win; concurrent scheduling can change which subset is
+retained. Returned values and ordering are unaffected. Changing revisions creates
+different keys but does not reclaim old retained data: use a new directory for a new
+working set and retire the old cache when its users have finished.
+
+Backend statistics include `writes`, `write_bytes` and `admission_rejections`.
+Write bytes count serialized tile headers and payloads, including a new entry removed
+by the post-write volume check. They exclude database/WAL and filesystem writes and
+are not a device-write counter. Full-cache reads continue to count as source misses.
 
 ## Reuse workers across passes
 
