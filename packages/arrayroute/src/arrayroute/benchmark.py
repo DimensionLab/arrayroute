@@ -12,24 +12,24 @@ import platform
 import random
 import time
 from collections.abc import Sequence
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
 
 from .backends import TensorStoreBackend, ZarrBackend, ZarristaBackend
+from .execution import ordered_map
 from .plan import ArraySpec, plan
 from .reader import ArrayReader, ReadStats
 
 
 def _digest(value: np.ndarray) -> str:
-    return hashlib.sha256(value.tobytes()).hexdigest()
+    return hashlib.sha256(memoryview(np.ascontiguousarray(value)).cast("B")).hexdigest()
 
 
 def create_fixture(
     root: Path, *, frames: int, edge: int, writer: str = "zarr-python",
-    layouts: Sequence[str] = ("frame", "brick", "sharded"),
+    layouts: Sequence[str] = ("frame", "brick", "sharded"), frame_workers: int = 1,
 ) -> dict:
     import zarr
     from zarr.codecs import ZstdCodec
@@ -42,6 +42,8 @@ def create_fixture(
         raise ValueError("Choose unique layouts from frame, brick and sharded")
     if writer not in {"zarr-python", "zarrista"}:
         raise ValueError("Unknown fixture writer")
+    if isinstance(frame_workers, bool) or not isinstance(frame_workers, int) or frame_workers < 1:
+        raise ValueError("frame_workers must be a positive integer")
     root.mkdir(parents=True, exist_ok=False)
     shape = (frames, edge, edge, edge, 3)
     arrays = {}
@@ -61,38 +63,46 @@ def create_fixture(
             compressors=[ZstdCodec(level=3)],
         )
     hashes = []
-    write_arrays = arrays
-    if writer == "zarrista":
-        import zarrista
 
-        write_arrays = {
-            name: zarrista.Array.open(zarrista.store.FilesystemStore(str(root / f"{name}.zarr")))
-            for name in arrays
-        }
+    def make_writer():
+        if writer == "zarrista":
+            import zarrista
 
-    def write_frame(array, t, value):
-        # Explicit time extent works identically in both engines.
-        array[t : t + 1] = value.reshape((1, *value.shape))
+            handles = {
+                name: zarrista.Array.open(
+                    zarrista.store.FilesystemStore(str(root / f"{name}.zarr"))
+                )
+                for name in arrays
+            }
+        else:
+            handles = {name: zarr.open_array(root / f"{name}.zarr", mode="r+") for name in arrays}
 
-    start = time.perf_counter()
-    with ThreadPoolExecutor(max_workers=len(arrays)) as pool:
-        for t in range(frames):
-            # Controlled broadband synthetic field; no claim of a physical CFD solution.
+        def write_frame(t: int) -> str:
+            # Each task owns whole time shards. No concurrent read-modify-write of a shard.
             rng = np.random.default_rng(83491 + t)
             value = rng.standard_normal(shape[1:], dtype=np.float32)
             x = np.arange(edge, dtype=np.float32) / edge
             value *= np.float32(0.03)
             value += np.sin(x[:, None, None, None] * 12 + t * 0.1)
-            hashes.append(_digest(value))
-            pending = [pool.submit(write_frame, array, t, value) for array in write_arrays.values()]
-            for future in pending:
-                future.result()
+            sha = _digest(value)
+            for array in handles.values():
+                array[t : t + 1] = value.reshape((1, *value.shape))
+            return sha
+
+        return write_frame
+
+    frame_bytes = edge**3 * 3 * 4
+    start = time.perf_counter()
+    with ordered_map(make_writer, range(frames), workers=frame_workers) as results:
+        for t, sha in enumerate(results):
+            hashes.append(sha)
             if t % 32 == 0 or t == frames - 1:
                 progress = {
                     "frames_written": t + 1,
                     "frames_total": frames,
-                    "logical_bytes_per_layout": (t + 1) * value.nbytes,
+                    "logical_bytes_per_layout": (t + 1) * frame_bytes,
                     "selected_layouts": list(arrays),
+                    "frame_workers": frame_workers,
                     "elapsed_s": time.perf_counter() - start,
                 }
                 temporary = root / "progress.tmp"
@@ -105,7 +115,11 @@ def create_fixture(
         "generation_seconds": time.perf_counter() - start,
         "kind": "deterministic broadband synthetic; not CFD; all values materialized",
         "writer": writer,
-        "concurrent_layout_writers": len(arrays),
+        "concurrent_layout_writers": 1,
+        "frame_workers": frame_workers,
+        "max_in_flight_frames": frame_workers,
+        "generated_frame_bytes_upper_bound": frame_workers * frame_bytes,
+        "memory_scope": "Generated frame arrays only; native codec scratch/cache additional",
         "selected_layouts": list(arrays),
         "layouts": {},
     }
@@ -310,6 +324,8 @@ def main() -> None:
     parser.add_argument("--create", action="store_true")
     parser.add_argument("--frames", type=int, default=8)
     parser.add_argument("--edge", type=int, default=128)
+    parser.add_argument("--frame-workers", type=int, default=1,
+                        help="Bounded independent frame writers; each owns its native handles")
     parser.add_argument("--writer", choices=["zarr-python", "zarrista"], default="zarr-python")
     parser.add_argument("--layouts", nargs="+", choices=["frame", "brick", "sharded"],
                         default=["frame", "brick", "sharded"],
@@ -321,7 +337,7 @@ def main() -> None:
     args = parser.parse_args()
     if args.create:
         create_fixture(args.root, frames=args.frames, edge=args.edge, writer=args.writer,
-                       layouts=args.layouts)
+                       layouts=args.layouts, frame_workers=args.frame_workers)
     if args.create_only:
         return
     if args.scan_engine:

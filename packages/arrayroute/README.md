@@ -202,7 +202,7 @@ intend to read instead of paying to materialize three copies:
 
 ```sh
 python -m arrayroute.benchmark --root /data/sharded-study --create --create-only \
-  --frames 43691 --edge 128 --layouts sharded --writer zarrista
+  --frames 43691 --edge 128 --layouts sharded --writer zarrista --frame-workers 4
 ```
 
 This materializes just over 1 TiB of logical float32 values in one sharded array; disk
@@ -587,6 +587,56 @@ may help a compute-heavy consumer or may add overhead. `python -m
 arrayroute.benchmark_prefetch --root /tmp/read-overlap` compares identical serial and
 prefetched tiles, verifies fixture hashes and every resulting stream digest/reduction,
 and records first-party Zarr/TensorStore results without a universal speed claim.
+
+## Bounded parallel frame processing
+
+`arrayroute.execution.ordered_map` runs independent reads or transforms with one
+worker-owned callable per active thread. The input is consumed lazily. A slow first
+frame cannot be overtaken, errors are propagated at their input position, and an
+infinite input cannot grow an unbounded submission queue.
+
+```python
+from arrayroute.execution import ordered_map
+from arrayroute.session import LocalReadSession
+
+
+def make_processor():
+    session = LocalReadSession("tensorstore", buffer_bytes=64 << 20, immutable=True)
+    reader = session.open("simulation.zarr", "velocity")
+
+    def process(frame):
+        selection = (frame,) + (slice(None),) * (len(reader.backend.spec.shape) - 1)
+        values = reader.read(selection)
+        return frame, values.mean(axis=tuple(range(values.ndim - 1)))
+
+    return process
+
+
+with ordered_map(make_processor, range(frame_count), workers=4, max_pending=4) as results:
+    for frame, mean_velocity in results:
+        record(frame, mean_velocity)
+```
+
+The factory constructs native handles on the thread that uses them. Do not return a
+shared mutable reader from the factory. At most `max_pending` submitted tasks/results
+are owned by the context, including its currently yielded result. Explicit array
+buffers scale with the worker budgets and task outputs; backend caches, codec scratch,
+and values retained by the caller are additional. This is not a process-RSS limit.
+Factories and cancellation callbacks must be thread-safe.
+
+Use the context manager on early exit. Closing cancels queued tasks and joins running
+threads, which releases their worker callables. A blocking native call cannot be killed
+by Python thread cancellation; use a process deadline for a hard wall-clock bound.
+Results and errors are never silently skipped. A source-iterator error stops iteration.
+
+The synthetic materialization benchmark accepts `--frame-workers 4`. Each task owns an
+entire time shard and generates its own seeded frame; workers never update the same
+shard. Layouts are written sequentially within each task. The independent scanner accepts
+`--workers 4`; its 256 MiB read-buffer budget is divided across workers, with one
+regenerated reference frame per worker added separately. Reports record concurrency and
+memory policy. Component times sum worker time; `verified_wall_GB_s` uses actual elapsed
+time including reference generation, hashing and evidence writes. Neither this benchmark
+nor parallel execution establishes a universal speedup.
 
 ## Indexed metadata snapshots
 

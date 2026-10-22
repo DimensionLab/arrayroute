@@ -5,14 +5,19 @@ import pytest
 from arrayroute.benchmark import _digest, create_fixture
 
 
+@pytest.mark.parametrize("frame_workers", [1, 4])
 @pytest.mark.parametrize("engine", ["zarr-python", "zarrista"])
-def test_fixture_native_write_and_receipt_are_independently_readable(tmp_path, engine):
+def test_fixture_native_write_and_receipt_are_independently_readable(
+    tmp_path, engine, frame_workers
+):
     if engine == "zarrista":
         pytest.importorskip(engine)
     import zarr
 
     root = tmp_path / "fixture"
-    receipt = create_fixture(root, frames=4, edge=32, writer=engine)
+    receipt = create_fixture(root, frames=4, edge=32, writer=engine, frame_workers=frame_workers)
+    assert receipt["frame_workers"] == frame_workers
+    assert receipt["max_in_flight_frames"] == frame_workers
     assert receipt["logical_bytes_per_layout"] == 4 * 32**3 * 3 * 4
     for name in receipt["layouts"]:
         a = zarr.open_array(root / f"{name}.zarr", mode="r")
@@ -47,10 +52,36 @@ def test_one_materialized_layout_is_readable_by_all_engines(tmp_path, writer):
 
 @pytest.mark.parametrize("options", [
     {"layouts": []}, {"layouts": ["unknown"]}, {"layouts": ["sharded", "sharded"]},
-    {"writer": "unknown"},
+    {"writer": "unknown"}, {"frame_workers": 0}, {"frame_workers": True},
+    {"frame_workers": 1.5},
 ])
 def test_invalid_fixture_choices_do_not_create_partial_output(tmp_path, options):
     root = tmp_path / "fixture"
     with pytest.raises(ValueError):
         create_fixture(root, frames=4, edge=32, **options)
     assert not root.exists()
+
+
+def test_parallel_write_failure_never_publishes_completion(tmp_path, monkeypatch):
+    import json
+
+    import arrayroute.benchmark as benchmark
+    from arrayroute.benchmark_materialized import reference_frame
+
+    original = benchmark._digest
+    broken = original(reference_frame(1, 32))
+
+    def fail_frame(value):
+        sha = original(value)
+        if sha == broken:
+            raise OSError("injected frame failure")
+        return sha
+
+    monkeypatch.setattr(benchmark, "_digest", fail_frame)
+    root = tmp_path / "partial"
+    with pytest.raises(OSError, match="injected frame failure"):
+        create_fixture(root, frames=8, edge=32, layouts=["sharded"], frame_workers=4)
+    assert not (root / "fixture.json").exists()
+    assert not (root / "materialization.json").exists()
+    progress = root / "progress.json"
+    assert not progress.exists() or json.loads(progress.read_text())["frames_written"] < 8

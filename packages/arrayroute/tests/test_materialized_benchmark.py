@@ -20,17 +20,22 @@ def fixture(tmp_path):
     return root
 
 
+@pytest.mark.parametrize("workers", [1, 4])
 @pytest.mark.parametrize("engine", ["zarr-python", "tensorstore", "zarrista"])
 @pytest.mark.parametrize("layout", ["frame", "brick", "sharded"])
-def test_complete_scan_independently_verifies_every_frame(fixture, tmp_path, engine, layout):
+def test_complete_scan_independently_verifies_every_frame(
+    fixture, tmp_path, engine, layout, workers
+):
     pytest.importorskip("zarr" if engine == "zarr-python" else engine)
     out = tmp_path / "report"
-    report = scan(fixture, out, engine=engine, layout=layout)
+    report = scan(fixture, out, engine=engine, layout=layout, workers=workers)
     assert report["complete"] and report["state"] == "complete"
     assert report["frames_verified"] == 4
     assert report["verified_logical_bytes"] == 4 * 32**3 * 3 * 4
     lines = [json.loads(line) for line in (out / "frames.jsonl").read_text().splitlines()]
     assert sorted(line["frame"] for line in lines) == list(range(4))
+    assert [line["frame"] for line in lines] == list(Permutation(4, seed=991))
+    assert report["workers"] == workers
     assert all(line["expected_sha256"] == line["actual_sha256"] for line in lines)
     with pytest.raises(FileExistsError):
         scan(fixture, out, engine=engine, layout=layout)
@@ -42,13 +47,14 @@ def test_regenerator_matches_previously_verified_cloud_frame():
     )
 
 
-def test_corruption_is_recorded_and_never_marked_complete(fixture, tmp_path):
+@pytest.mark.parametrize("workers", [1, 4])
+def test_corruption_is_recorded_and_never_marked_complete(fixture, tmp_path, workers):
     array = zarr.open_array(fixture / "sharded.zarr", mode="r+")
     frame = Permutation(4, seed=991)[0]
     array[frame] = np.zeros((32, 32, 32, 3), dtype=np.float32)
     output = tmp_path / "corrupt"
     with pytest.raises(ValueError, match="differs"):
-        scan(fixture, output, engine="zarr-python")
+        scan(fixture, output, engine="zarr-python", workers=workers)
     report = json.loads((output / "report.json").read_text())
     assert not report["complete"] and report["state"] == "failed"
     assert report["frames_verified"] == 0
@@ -71,6 +77,13 @@ def test_incomplete_materialization_refused(fixture, tmp_path):
     progress.write_text(json.dumps(info))
     with pytest.raises(ValueError, match="incomplete"):
         scan(fixture, tmp_path / "report", engine="zarr-python")
+    assert not (tmp_path / "report").exists()
+
+
+@pytest.mark.parametrize("workers", [0, -1, True, 1.5, 1000000])
+def test_invalid_worker_or_memory_budget_refused_before_output(fixture, tmp_path, workers):
+    with pytest.raises(ValueError):
+        scan(fixture, tmp_path / "report", engine="zarr-python", workers=workers)
     assert not (tmp_path / "report").exists()
 
 

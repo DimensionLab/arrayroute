@@ -19,6 +19,7 @@ from pathlib import Path
 import numpy as np
 
 from .backends import TensorStoreBackend, ZarrBackend, ZarristaBackend
+from .execution import ProcessingCancelledError, ordered_map
 from .permutation import Permutation
 from .reader import ArrayReader, Backend
 
@@ -36,7 +37,7 @@ def digest(value: np.ndarray) -> str:
     return hashlib.sha256(memoryview(np.ascontiguousarray(value)).cast("B")).hexdigest()
 
 
-def open_backend(path: Path, engine: str) -> Backend:
+def open_backend(path: Path, engine: str, *, read_threads: int = 8) -> Backend:
     if engine == "zarr-python":
         import zarr
 
@@ -55,8 +56,8 @@ def open_backend(path: Path, engine: str) -> Backend:
                 context=ts.Context(
                     {
                         "cache_pool": {"total_bytes_limit": 0},
-                        "data_copy_concurrency": {"limit": 8},
-                        "file_io_concurrency": {"limit": 8},
+                        "data_copy_concurrency": {"limit": read_threads},
+                        "file_io_concurrency": {"limit": read_threads},
                     }
                 ),
             ).result()
@@ -72,7 +73,10 @@ def scan(
     layout: str = "sharded",
     deadline: float | None = None,
     limit: int | None = None,
+    workers: int = 1,
 ) -> dict:
+    if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
+        raise ValueError("workers must be a positive integer")
     if layout not in {"frame", "brick", "sharded"}:
         raise ValueError("Unknown layout")
     if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
@@ -96,6 +100,9 @@ def scan(
         or progress.get("logical_bytes_per_layout") != math.prod(shape) * 4
     ):
         raise ValueError("Fixture is incomplete or does not match the synthetic generator")
+    per_worker_buffer = (256 << 20) // workers
+    if math.prod(shape[1:]) * 4 >= per_worker_buffer:
+        raise ValueError("Workers exceed the shared read-buffer budget for one frame each")
     output.mkdir(parents=True, exist_ok=False)
     (output / "source-progress.json").write_bytes(progress_bytes)
     versions = {}
@@ -123,10 +130,18 @@ def scan(
         "versions": versions,
         "platform": platform.platform(),
         "cache_state": "OS uncontrolled; one traversal in seeded permuted order",
-        "memory_policy": "One read frame and one regenerated reference; no dataset-sized index",
+        "memory_policy": (
+            "Shared read-buffer budget plus one reference frame per worker; "
+            "native scratch/cache additional"
+        ),
+        "workers": workers,
+        "max_in_flight_frames": workers,
+        "read_threads_per_worker": max(1, 8 // workers),
+        "per_worker_buffer_bytes": per_worker_buffer,
+        "reference_bytes_upper_bound": workers * math.prod(shape[1:]) * 4,
+        "timing_scope": "Component seconds are sums across workers; elapsed_seconds is wall time",
         "buffer_bytes": 256 << 20,
     }
-    reader = ArrayReader(backend, buffer_bytes=256 << 20)
     started = time.perf_counter()
 
     def save() -> None:
@@ -135,42 +150,63 @@ def scan(
         temporary.write_text(json.dumps(report, indent=2) + "\n")
         temporary.replace(output / "report.json")
 
+    def make_verifier():
+        reader = ArrayReader(
+            open_backend(root / f"{layout}.zarr", engine, read_threads=max(1, 8 // workers)),
+            buffer_bytes=per_worker_buffer,
+        )
+
+        def verify(frame: int) -> dict:
+            start = time.perf_counter()
+            value = reader.read((frame,) + (slice(None),) * 4)
+            read_s = time.perf_counter() - start
+            start = time.perf_counter()
+            expected = reference_frame(frame, shape[1])
+            reference_s = time.perf_counter() - start
+            start = time.perf_counter()
+            expected_hash, actual_hash = digest(expected), digest(value)
+            hash_s = time.perf_counter() - start
+            valid = value.shape == expected.shape and value.dtype == expected.dtype
+            valid = valid and actual_hash == expected_hash
+            return {
+                "frame": frame, "bytes": value.nbytes, "read_s": read_s,
+                "reference_s": reference_s, "hash_s": hash_s,
+                "expected_sha256": expected_hash, "actual_sha256": actual_hash,
+                "verified": valid,
+            }
+
+        return verify
+
+    def expired() -> bool:
+        return deadline is not None and time.time() >= deadline
+
     save()
     try:
         with (output / "frames.jsonl").open("x") as log:
             stop = min(shape[0], limit) if limit is not None else shape[0]
-            for frame in Permutation(shape[0], seed=991).indices(stop=stop):
-                if deadline is not None and time.time() >= deadline:
-                    report["state"] = "deadline"
-                    break
-                start = time.perf_counter()
-                value = reader.read((frame,) + (slice(None),) * 4)
-                read_s = time.perf_counter() - start
-                start = time.perf_counter()
-                expected = reference_frame(frame, shape[1])
-                reference_s = time.perf_counter() - start
-                start = time.perf_counter()
-                expected_hash, actual_hash = digest(expected), digest(value)
-                hash_s = time.perf_counter() - start
-                valid = value.shape == expected.shape and value.dtype == expected.dtype
-                valid = valid and actual_hash == expected_hash
-                log.write(json.dumps({
-                    "frame": frame, "bytes": value.nbytes, "read_s": read_s,
-                    "reference_s": reference_s, "hash_s": hash_s,
-                    "expected_sha256": expected_hash, "actual_sha256": actual_hash,
-                    "verified": valid,
-                }) + "\n")
-                log.flush()
-                if not valid:
-                    raise ValueError(f"Frame {frame} differs from independently regenerated values")
-                report["frames_verified"] += 1
-                report["verified_logical_bytes"] += value.nbytes
-                report["read_seconds"] += read_s
-                report["reference_seconds"] += reference_s
-                report["hash_seconds"] += hash_s
-                del value, expected
-                if report["frames_verified"] % 32 == 0:
-                    save()
+            indices = Permutation(shape[0], seed=991).indices(stop=stop)
+            try:
+                with ordered_map(make_verifier, indices, workers=workers,
+                                 cancelled=expired) as results:
+                    for row in results:
+                        log.write(json.dumps(row) + "\n")
+                        log.flush()
+                        if not row["verified"]:
+                            raise ValueError(
+                                f"Frame {row['frame']} differs from "
+                                "independently regenerated values"
+                            )
+                        report["frames_verified"] += 1
+                        report["verified_logical_bytes"] += row["bytes"]
+                        report["read_seconds"] += row["read_s"]
+                        report["reference_seconds"] += row["reference_s"]
+                        report["hash_seconds"] += row["hash_s"]
+                        if report["frames_verified"] % 32 == 0:
+                            save()
+            except ProcessingCancelledError:
+                if not expired():
+                    raise
+                report["state"] = "deadline"
             else:
                 report["complete"] = report["frames_verified"] == shape[0]
                 report["state"] = "complete" if report["complete"] else "limited"
@@ -181,7 +217,12 @@ def scan(
     finally:
         report["finished_at"] = time.time()
         seconds = report["read_seconds"]
-        report["read_GB_s"] = report["verified_logical_bytes"] / seconds / 1e9 if seconds else None
+        report["aggregate_read_GB_s"] = (
+            report["verified_logical_bytes"] / seconds / 1e9 if seconds else None
+        )
+        report["verified_wall_GB_s"] = (
+            report["verified_logical_bytes"] / (time.perf_counter() - started) / 1e9
+        )
         save()
     return report
 
@@ -193,6 +234,8 @@ def main() -> None:
     parser.add_argument(
         "--engine", choices=["zarr-python", "zarrista", "tensorstore"], required=True
     )
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Bounded concurrent independent frame verifiers")
     parser.add_argument("--layout", choices=["frame", "brick", "sharded"], default="sharded")
     parser.add_argument(
         "--deadline", type=float, help="Unix seconds; stop before starting a new frame"
