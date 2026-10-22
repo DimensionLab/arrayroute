@@ -11,7 +11,8 @@ from typing import Any
 
 from .backends import DenseGatherBackend, TensorStoreBackend, ZarrBackend, ZarristaBackend
 from .budget import ReadBudget
-from .plan import Selection
+from .gather import ParallelGatherBackend
+from .plan import GatherWindow, Selection
 from .ranges import RangePolicy
 from .reader import ArrayReader, Backend, ReadStats
 
@@ -49,6 +50,7 @@ class LocalReadSession:
         range_policy: RangePolicy | None = None,
         read_budget: ReadBudget | None = None,
         read_strategy: str = "native",
+        gather_workers: int = 4,
     ):
         if not isinstance(immutable, bool):
             raise TypeError("immutable must be a boolean")
@@ -58,8 +60,16 @@ class LocalReadSession:
         )
         if engine not in {"zarr-python", "tensorstore", "zarrista"}:
             raise ValueError(f"Unknown array engine {engine!r}")
-        if read_strategy not in {"native", "dense"}:
-            raise ValueError("read_strategy must be native or dense")
+        if read_strategy not in {"native", "dense", "parallel"}:
+            raise ValueError("read_strategy must be native, dense or parallel")
+        if (isinstance(gather_workers, bool) or not isinstance(gather_workers, int)
+                or not 1 <= gather_workers <= 256):
+            raise ValueError("Gather workers must be an integer from 1 to 256")
+        if read_strategy == "parallel" and engine != "zarrista":
+            raise ValueError("Parallel gathering currently requires the Zarrista engine")
+        if read_strategy != "parallel" and gather_workers != 4:
+            raise ValueError("gather_workers requires the parallel read strategy")
+        self.gather_workers = gather_workers
         self.read_strategy = read_strategy
         if (
             min(buffer_bytes, max_open_arrays, tensorstore_threads) < 1
@@ -141,9 +151,16 @@ class LocalReadSession:
         else:
             import zarrista
 
-            backend = ZarristaBackend(
-                zarrista.Array.open(zarrista.store.FilesystemStore(key[0]), path="/" + key[1])
-            )
+            array = zarrista.Array.open(zarrista.store.FilesystemStore(key[0]), path="/" + key[1])
+            native = ZarristaBackend(array)
+            backend = native
+            if self.read_strategy == "parallel":
+                if not native._partial_shards:
+                    raise ValueError("Parallel gathering requires independently decodable shards")
+                backend = ParallelGatherBackend(
+                    native, lambda: ZarristaBackend(array),
+                    GatherWindow(tuple(array.chunk_shape([0] * array.ndim)), self.gather_workers),
+                )
         if self.read_strategy == "dense":
             backend = DenseGatherBackend(backend)
         reader = ArrayReader(

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""O(rank) selection costs; lazy subdivision without a global chunk inventory."""
+"""Bounded selection costs; lazy subdivision without a global chunk inventory."""
 
 from __future__ import annotations
 
@@ -35,12 +35,29 @@ class DecodeWindow:
 
 
 @dataclass(frozen=True)
+class GatherWindow:
+    """Independent grid regions with one live decoded chunk per worker."""
+
+    region_shape: tuple[int, ...]
+    workers: int
+
+    def __post_init__(self) -> None:
+        if (isinstance(self.workers, bool) or not isinstance(self.workers, int)
+                or not 1 <= self.workers <= 256):
+            raise ValueError("Gather workers must be an integer from 1 to 256")
+        if (not self.region_shape or any(isinstance(v, bool) or not isinstance(v, int)
+                                        or v < 1 for v in self.region_shape)):
+            raise ValueError("Gather regions require positive integer dimensions")
+
+
+@dataclass(frozen=True)
 class ArraySpec:
     shape: tuple[int, ...]
     chunks: tuple[int, ...]
     itemsize: int
     decode_window: DecodeWindow | None = None
     dense_gather: bool = False
+    gather_window: GatherWindow | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.dense_gather, bool):
@@ -52,6 +69,17 @@ class ArraySpec:
         for values, minimum in ((self.shape, 0), (self.chunks, 1), ((self.itemsize,), 1)):
             if any(isinstance(v, bool) or not isinstance(v, int) or v < minimum for v in values):
                 raise ValueError("shape, chunks and itemsize require valid integer dimensions")
+
+        gather = self.gather_window
+        if gather is not None:
+            if not isinstance(gather, GatherWindow):
+                raise TypeError("gather_window must be a GatherWindow or None")
+            if (self.dense_gather or self.decode_window is None
+                    or self.decode_window.max_chunks != 1):
+                raise ValueError("Parallel gathering requires a single-chunk native decode window")
+            if (len(gather.region_shape) != len(self.chunks)
+                    or any(r % c for r, c in zip(gather.region_shape, self.chunks, strict=True))):
+                raise ValueError("Gather regions must be a whole number of chunks on each axis")
 
     @property
     def logical_bytes(self) -> int:
@@ -67,8 +95,9 @@ class ReadPlan:
     decoded_bytes_upper_bound: int
     peak_decoded_bytes_upper_bound: int
     intermediate_bytes_upper_bound: int = 0
-    strategy: Literal["native", "dense-gather"] = "native"
+    strategy: Literal["native", "dense-gather", "parallel-gather"] = "native"
     read_selection: Selection | None = None
+    gather_workers: int = 1
 
     @property
     def decode_amplification(self) -> float:
@@ -129,8 +158,28 @@ def plan(spec: ArraySpec, selection: Selection, *, buffer_bytes: int | None = No
         touched * math.prod(spec.chunks) * spec.itemsize,
         live_chunks * math.prod(spec.chunks) * spec.itemsize,
     )
-    if (not spec.dense_gather or buffer_bytes is None or not request.output_bytes
+    if (buffer_bytes is None or not request.output_bytes
             or not any(isinstance(s, slice) and s.step > 1 for s in normalized)):
+        return request
+    gather = spec.gather_window
+    if gather is not None:
+        regions = plan(ArraySpec(spec.shape, gather.region_shape, spec.itemsize),
+                       request.selection).chunks_touched
+        region_output = spec.itemsize * math.prod(
+            min(_length(s), (r + s.step - 1) // s.step)
+            for s, r in zip(request.selection, gather.region_shape, strict=True)
+            if isinstance(s, slice)
+        )
+        for workers in range(min(gather.workers, regions), 1, -1):
+            candidate = replace(
+                request, strategy="parallel-gather", gather_workers=workers,
+                peak_decoded_bytes_upper_bound=workers * request.peak_decoded_bytes_upper_bound,
+                intermediate_bytes_upper_bound=min(request.output_bytes, workers * region_output),
+            )
+            if candidate.buffer_bytes_upper_bound <= buffer_bytes:
+                return candidate
+        return request
+    if not spec.dense_gather:
         return request
     bounds = tuple(
         s if isinstance(s, int) else slice(s.start, s.start + (_length(s) - 1) * s.step + 1, 1)

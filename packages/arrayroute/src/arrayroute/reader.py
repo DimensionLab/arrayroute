@@ -7,7 +7,7 @@ import time
 from collections.abc import Callable, Generator, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 import numpy as np
@@ -25,10 +25,17 @@ class Backend(Protocol):
 
 @dataclass
 class ReadStats:
+    """Completed tile plans; worker limits are admitted maxima, not observed active threads.
+
+    A decoded cache hit can satisfy a parallel plan without starting any workers.
+    """
+
     requests: int = 0
     output_bytes: int = 0
     decoded_bytes_upper_bound: int = 0
     seconds: float = 0.0
+    read_strategies: dict[str, int] = field(default_factory=dict)
+    gather_workers_peak: int = 0
 
 
 class ArrayReader:
@@ -42,8 +49,9 @@ class ArrayReader:
         self.buffer_bytes = (min(buffer_bytes, shared_budget.max_bytes)
                              if shared_budget is not None else buffer_bytes)
         self.shared_budget = shared_budget
-        if backend.spec.dense_gather and not callable(getattr(backend, "read_plan", None)):
-            raise TypeError("Dense gather metadata requires a backend with read_plan")
+        if ((backend.spec.dense_gather or backend.spec.gather_window is not None)
+                and not callable(getattr(backend, "read_plan", None))):
+            raise TypeError("Gather metadata requires a backend with read_plan")
         self._execute: Callable[[ReadPlan], np.ndarray] = getattr(
             backend, "read_plan", lambda request: backend.read(request.selection))
         if not callable(self._execute):
@@ -73,6 +81,10 @@ class ArrayReader:
                     raise ValueError("Backend returned an unexpected shape or dtype")
                 if stats is not None:
                     stats.requests += 1
+                    strategy = tile.plan.strategy
+                    stats.read_strategies[strategy] = stats.read_strategies.get(strategy, 0) + 1
+                    stats.gather_workers_peak = max(
+                        stats.gather_workers_peak, tile.plan.gather_workers)
                     stats.seconds += time.perf_counter() - start
                     stats.output_bytes += value.nbytes
                     stats.decoded_bytes_upper_bound += tile.plan.decoded_bytes_upper_bound

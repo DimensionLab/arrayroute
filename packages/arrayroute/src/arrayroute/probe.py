@@ -8,6 +8,7 @@ import math
 import random
 import statistics
 import time
+from collections import Counter
 from collections.abc import Callable, Sequence
 from typing import cast
 
@@ -131,7 +132,9 @@ def probe_reads(
                                        buffersize=max(1, 32768 // dtype.itemsize)):
                     digest.update(cast(np.ndarray, block).tobytes())
                 return {'sha256': digest.hexdigest(), 'bytes': value.nbytes,
-                        'requests': stats.requests, 'read_seconds': stats.seconds}
+                        'requests': stats.requests, 'read_seconds': stats.seconds,
+                        'read_strategies': stats.read_strategies,
+                        'gather_workers_peak': stats.gather_workers_peak}
 
             return read
 
@@ -152,11 +155,16 @@ def probe_reads(
             if any((r['sha256'], r['bytes']) != (e['sha256'], e['bytes'])
                    for r, e in zip(rows, reference, strict=True)):
                 raise ValueError("Pilot values changed from the sequential reference")
+            strategies = Counter()
+            for row in rows:
+                strategies.update(row['read_strategies'])
             report['trials'].append({
                 'repetition': repetition, 'workers': count, 'elapsed_seconds': elapsed,
                 'output_bytes': sum(r['bytes'] for r in rows),
                 'read_seconds_sum': sum(r['read_seconds'] for r in rows),
                 'requests': sum(r['requests'] for r in rows), 'verified': True,
+                'read_strategies': dict(strategies),
+                'gather_workers_peak': max(r['gather_workers_peak'] for r in rows),
             })
         medians = {count: statistics.median(t['elapsed_seconds'] for t in report['trials']
                                            if t['workers'] == count) for count in allowed}

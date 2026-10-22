@@ -1113,3 +1113,53 @@ buffer authority and reports native cost; pass `buffer_bytes=` to select a dense
 plan. `plan_concurrency` reports each candidate's strategy (or `per-tile` when
 stream subdivision is needed). Snapshot and remote session constructors do not
 currently expose this opt-in.
+
+## Parallel gathering with bounded intermediates
+
+For independently decodable Zarr shards, a local Zarrista session can opt into
+parallel region reads without allocating a dense bounding array:
+
+```python
+session = LocalReadSession(
+    "zarrista", read_strategy="parallel", gather_workers=8, buffer_bytes=8 << 20,
+)
+reader = session.open("velocity.zarr", "")
+request = reader.plan(selection)
+print(request.strategy, request.gather_workers, request.intermediate_bytes_upper_bound)
+preview = reader.read(selection)
+```
+
+The planner considers up to `gather_workers` workers (1–256), bounded further by the
+number of selected shards and the available buffer. It charges the final output,
+worker-owned selected regions, and one decoded chunk per active worker. It lowers
+the worker count before choosing ordinary native selection when fewer than two
+workers fit. Contiguous requests and requests within one region use native selection.
+Streaming, materialization and prefetch re-plan with their actual remaining buffers.
+This is an explicit policy; small requests can get slower from scheduling overhead.
+
+Selected shards are generated lazily. Each worker gathers only touched subchunks
+inside its shard; results are copied into disjoint locations in the final compact
+array. The bounded executor retains at most one region per scheduled slot, including
+the region being consumed. Every call joins its pool, including on failure, so no
+background worker outlives its read reservation. It cannot interrupt an already
+running native call. Native codec threads, shard indexes, caches and scratch remain
+outside the explicit array-buffer allowance. Outer read workers multiply inner
+worker pools; benchmark the whole concurrency configuration rather than assuming
+more threads improve throughput.
+
+`ParallelGatherBackend(base, factory, GatherWindow(region_shape, workers))` is the
+generic extension point. The factory must supply independent mutable reader state
+with the same metadata as `base`. A read-only native array handle may be shared.
+Worker results must not retain arrays larger than their selected region or one
+decoded chunk; workers must not reserve from the parent reader's shared `ReadBudget`.
+The base must guarantee a one-chunk decode window for strided reads; regions must
+align to whole chunks on every axis. This capability is not inferred for arbitrary
+engines. `LocalReadSession` currently exposes it only for Zarrista partial-shard
+reads; other engines and outer-codec shards are rejected for this strategy.
+
+`ReadStats.read_strategies` counts completed tile executions by strategy, and
+`gather_workers_peak` reports the largest admitted inner worker limit. This is
+not a measurement of active threads; a cache hit may launch none.
+`probe_reads` includes these in every trial, so the requested maximum can be
+compared with actual budget-reduced counts. Native reads report one gather worker;
+that does not count the engine's own internal threads.
