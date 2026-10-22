@@ -33,7 +33,7 @@ buffer before requesting the next. `cancelled` accepts a callable checked betwee
 
 Planning is O(array rank), even for a petabyte logical shape. It does not enumerate the
 global chunk grid. Subdivision is lazy and prefers existing chunk boundaries. The buffer
-budget covers the conservative sum of decoded chunks and output buffers for each request,
+budget covers peak live decoded chunks and output buffers for each request,
 including the destination when materializing. Backend caches, encoded I/O buffers, decoder
 scratch and caller-retained buffers are additional memory; this is not a process RSS cap.
 An individual chunk that cannot fit is rejected. Set backend cache/concurrency limits too.
@@ -42,6 +42,15 @@ Supported selections are integers and positive-stride slices on fixed-size array
 lossy conversion is performed. Decoded-byte estimates assume full inner-chunk decoding;
 partial codecs can do better. Transport bytes must be measured by the backend, not inferred
 from those estimates. A large logical shape is not evidence of large physical I/O throughput.
+
+`ReadPlan.decoded_bytes_upper_bound` measures total decode work; it is separate from
+`peak_decoded_bytes_upper_bound`, which determines memory admission together with the output.
+By default all touched chunks are charged as live. A backend may declare an
+`ArraySpec(..., decode_window=DecodeWindow(max_chunks=1, strided_only=True))` only when its
+implementation releases decoded chunks before requesting successors. ArrayRoute's Zarrista
+adapter supplies this guarantee for strided partial-shard reads. Contiguous bulk reads,
+unsharded reads and outer-codec shards retain conservative accounting. Other adapters do
+not inherit this guarantee. Total decode work and amplification remain unchanged.
 
 Zarrista strided reads gather only touched inner chunks. When partial shard decoding is
 available, the adapter reuses one shard index while gathering those chunks and discards
@@ -1043,9 +1052,9 @@ already-running native I/O still follows the backend's cancellation behavior.
 
 This is a conservative **planned-buffer** budget. It does not include compressed inputs,
 transport copies, native caches, codec scratch, metadata or caller-retained arrays, and
-does not enforce process RSS. The planner counts all chunks touched even for engines
-that decode them one at a time. A smaller budget can therefore throttle an efficient
-streaming engine unnecessarily. Keep enough room for a decoded chunk and measure the
+does not enforce process RSS. The planner counts all chunks touched unless a backend
+declares a verified decode window for that read path. Keep enough room for a decoded chunk
+and measure the
 memory/throughput curve for your data before choosing a limit.
 
 Construct the pool after spawning each process; it cannot be pickled or reused after

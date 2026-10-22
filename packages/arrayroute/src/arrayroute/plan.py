@@ -12,12 +12,37 @@ Selection = tuple[int | slice, ...]
 
 
 @dataclass(frozen=True)
+class DecodeWindow:
+    """Backend guarantee about live decoded chunks, excluding codec scratch/cache.
+
+    Use only when the reader releases decoded chunks before requesting successors.
+    A stride-only guarantee does not apply to contiguous native bulk reads.
+    """
+
+    max_chunks: int
+    strided_only: bool = False
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.max_chunks, bool)
+            or not isinstance(self.max_chunks, int)
+            or self.max_chunks < 1
+        ):
+            raise ValueError("max_chunks must be a positive integer")
+        if not isinstance(self.strided_only, bool):
+            raise TypeError("strided_only must be a boolean")
+
+
+@dataclass(frozen=True)
 class ArraySpec:
     shape: tuple[int, ...]
     chunks: tuple[int, ...]
     itemsize: int
+    decode_window: DecodeWindow | None = None
 
     def __post_init__(self) -> None:
+        if self.decode_window is not None and not isinstance(self.decode_window, DecodeWindow):
+            raise TypeError("decode_window must be a DecodeWindow or None")
         if not self.shape or len(self.shape) != len(self.chunks):
             raise ValueError("shape and chunks must have the same nonzero rank")
         for values, minimum in ((self.shape, 0), (self.chunks, 1), ((self.itemsize,), 1)):
@@ -36,6 +61,7 @@ class ReadPlan:
     output_bytes: int
     chunks_touched: int
     decoded_bytes_upper_bound: int
+    peak_decoded_bytes_upper_bound: int
 
     @property
     def decode_amplification(self) -> float:
@@ -44,7 +70,7 @@ class ReadPlan:
     @property
     def buffer_bytes_upper_bound(self) -> int:
         # Encoded transport buffers and backend caches are separate from this budget.
-        return self.output_bytes + self.decoded_bytes_upper_bound
+        return self.output_bytes + self.peak_decoded_bytes_upper_bound
 
 
 def _length(s: slice) -> int:
@@ -77,12 +103,19 @@ def plan(spec: ArraySpec, selection: Selection) -> ReadPlan:
             normalized.append(index)
             counts.append(1)
     touched = math.prod(counts)
+    live_chunks = touched
+    window = spec.decode_window
+    if window is not None and (
+        not window.strided_only or any(isinstance(s, slice) and s.step > 1 for s in normalized)
+    ):
+        live_chunks = min(touched, window.max_chunks)
     return ReadPlan(
         tuple(normalized),
         tuple(shape),
         math.prod(shape) * spec.itemsize,
         touched,
         touched * math.prod(spec.chunks) * spec.itemsize,
+        live_chunks * math.prod(spec.chunks) * spec.itemsize,
     )
 
 

@@ -7,7 +7,7 @@ from typing import Any
 
 import numpy as np
 
-from .plan import ArraySpec, Selection, plan
+from .plan import ArraySpec, DecodeWindow, Selection, plan
 
 
 class ZarrBackend:
@@ -52,7 +52,8 @@ class ZarristaBackend:
         if outer_codec:
             # A codec outside the shard requires decoding the complete shard.
             chunks = array.chunk_shape([0] * array.ndim)
-        self.spec = ArraySpec(tuple(array.shape), tuple(chunks), self.dtype.itemsize)
+        window = DecodeWindow(1, strided_only=True) if self._partial_shards else None
+        self.spec = ArraySpec(tuple(array.shape), tuple(chunks), self.dtype.itemsize, window)
 
     def read(self, selection: Selection) -> np.ndarray:
         if any(isinstance(s, slice) and s.step not in (None, 1) for s in selection):

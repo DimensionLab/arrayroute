@@ -27,7 +27,7 @@ class ConcurrencyPlan:
     max_workers_without_tiling: int
     candidates: tuple[ReadConcurrency, ...]
     scope: str = (
-        "Output plus conservatively decoded chunks for one value per reader; excludes "
+        "Output plus peak live decoded chunks for one value per reader; excludes "
         "queued batches, caller-retained outputs, native caches, transport and codec scratch. "
         "Candidates are memory plans, not throughput predictions."
     )

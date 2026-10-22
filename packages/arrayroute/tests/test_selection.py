@@ -199,6 +199,7 @@ def test_outer_shard_codec_is_charged_as_whole_shard(tmp_path, engine):
     array[:] = 1
     backend = LocalReadSession(engine).open(path, '').backend
     assert backend.spec.chunks == (16, 16)
+    assert backend.spec.decode_window is None
     with pytest.raises(MemoryError):
         ArrayReader(backend, buffer_bytes=512).read((0, 0))
     assert ArrayReader(backend, buffer_bytes=2048).read((0, 0)) == np.float32(1)
@@ -220,6 +221,7 @@ def test_outer_transpose_preserves_axes_and_charges_whole_shard(tmp_path, engine
     array[:] = values
     backend = LocalReadSession(engine).open(path, '').backend
     assert backend.spec.chunks == (16, 32)
+    assert backend.spec.decode_window is None
     with pytest.raises(MemoryError):
         ArrayReader(backend, buffer_bytes=1024).read((7, 25))
     assert ArrayReader(backend, buffer_bytes=4096).read((7, 25)) == values[7, 25]
