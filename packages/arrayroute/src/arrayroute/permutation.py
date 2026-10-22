@@ -11,6 +11,9 @@ import hashlib
 import operator
 import sys
 from collections.abc import Iterator
+from dataclasses import dataclass, field, fields
+from itertools import islice
+from typing import ClassVar, Literal
 
 
 class Permutation:
@@ -94,3 +97,87 @@ class Permutation:
 
     def __iter__(self) -> Iterator[int]:
         return self.indices()
+
+
+@dataclass(frozen=True, slots=True)
+class BatchPartition:
+    """Rank-local batches of one shared epoch permutation, without padding duplicates.
+
+    ``tail='drop'`` removes the incomplete *global* batch, so all ranks have the
+    same number of full batches. ``tail='uneven'`` preserves every sample exactly
+    once; consumers must explicitly handle unequal collective/optimizer counts.
+
+    ``start_batch`` is the number of globally consumed batches per rank, not the
+    number prefetched. A checkpoint must separately bind this plan to an immutable
+    source revision and retain optimizer/RNG state. Changing world size mid-epoch is
+    not a supported replay. Iteration retains O(batch_size) indices, not O(size).
+    """
+
+    size: int
+    rank: int
+    world_size: int
+    batch_size: int
+    tail: Literal["drop", "uneven"]
+    seed: int = 0
+    epoch: int = 0
+    start_batch: int = 0
+    _order: Permutation = field(init=False, repr=False, compare=False)
+    algorithm: ClassVar[str] = "strided-rank-batches-v1"
+
+    def __post_init__(self) -> None:
+        for name in ("size", "rank", "world_size", "batch_size", "seed", "epoch", "start_batch"):
+            object.__setattr__(self, name, operator.index(getattr(self, name)))
+        if self.world_size < 1 or not 0 <= self.rank < self.world_size:
+            raise ValueError("Require world_size >= 1 and 0 <= rank < world_size")
+        if not 1 <= self.batch_size <= sys.maxsize:
+            raise ValueError("batch_size must be within the platform's positive index range")
+        if self.tail not in ("drop", "uneven"):
+            raise ValueError("tail must be explicitly 'drop' or 'uneven'")
+        object.__setattr__(self, "_order", Permutation(self.size, seed=self.seed, epoch=self.epoch))
+        if not 0 <= self.start_batch <= self.global_batches:
+            raise ValueError("start_batch must be within the global epoch batch range")
+
+    @property
+    def global_batches(self) -> int:
+        """Maximum rank batch count before resume; equal on every rank in drop mode."""
+        width = self.world_size * self.batch_size
+        return self.size // width if self.tail == "drop" else -(-self.size // width)
+
+    @property
+    def dropped_samples(self) -> int:
+        """Global incomplete-tail count, independent of resume position."""
+        return self.size % (self.world_size * self.batch_size) if self.tail == "drop" else 0
+
+    def positions(self) -> range:
+        """Unpermuted global positions owned by this rank after the consumed prefix."""
+        start = self.start_batch * self.batch_size * self.world_size + self.rank
+        return range(start, self.size - self.dropped_samples, self.world_size)
+
+    @property
+    def sample_count(self) -> int:
+        return len(self.positions())
+
+    def __len__(self) -> int:
+        return -(-self.sample_count // self.batch_size)
+
+    def __iter__(self) -> Iterator[list[int]]:
+        indices = (self._order[position] for position in self.positions())
+        while batch := list(islice(indices, self.batch_size)):
+            yield batch
+
+    def state_dict(self) -> dict[str, int | str]:
+        """Portable partition identity. Never advances a cursor on prefetch."""
+        return {
+            "algorithm": self.algorithm,
+            "permutation": Permutation.algorithm,
+            **{f.name: getattr(self, f.name) for f in fields(self) if f.init},
+        }
+
+    @classmethod
+    def from_state_dict(cls, state: dict) -> BatchPartition:
+        required = {f.name for f in fields(cls) if f.init} | {"algorithm", "permutation"}
+        if set(state) != required:
+            raise ValueError("Partition state has missing or unknown fields")
+        if state["algorithm"] != cls.algorithm or state["permutation"] != Permutation.algorithm:
+            raise ValueError("Partition state uses an unsupported ordering algorithm")
+        return cls(**{name: state[name] for name in required - {"algorithm", "permutation"}})

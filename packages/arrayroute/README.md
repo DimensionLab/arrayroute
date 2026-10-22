@@ -61,6 +61,42 @@ size, seed, epoch and next position for replay. The canonical dataset order must
 fixed. `order.indices(start=rank, step=world_size)` partitions positions without duplicate
 padding; shard lengths can differ, so synchronized trainers must handle their tails.
 
+`arrayroute.permutation.BatchPartition` makes that tail policy explicit for batched
+consumers without materializing an index array:
+
+```python
+from arrayroute.permutation import BatchPartition
+
+partition = BatchPartition(
+    size=10**12, rank=7, world_size=128, batch_size=8,
+    seed=73, epoch=4, tail="drop", start_batch=0,
+)
+for indices in partition:
+    batch = dataset.read(indices)  # your dataset adapter
+    train(batch)
+```
+
+`tail="drop"` excludes only the incomplete global batch; every rank has equally many
+full batches, without duplicate padding. `dropped_samples` reports the global excluded
+count. `tail="uneven"` preserves every sample once but can leave unequal rank batch
+counts: distributed collective callers must handle uneven participation explicitly.
+If the entire dataset is smaller than a global batch, drop mode yields zero batches.
+
+The iterator can also be a PyTorch `DataLoader(batch_sampler=partition)` without a
+Torch dependency in ArrayRoute. All ranks must use the same canonical dataset order,
+source revision, size, seed, epoch, world size, batch size and tail policy. Construct a
+new plan for a new epoch. Save `partition.state_dict()` with the checkpoint and restore
+using `BatchPartition.from_state_dict(...)`. Set `start_batch` to the number of
+**consumed** per-rank global steps; prefetching does not advance it. Save dataset identity,
+optimizer state and framework RNG state separately. Replay does not support changing
+rank topology mid-epoch. Uneven ranks that finish early can still restore the shared
+global consumed-step position. `sample_count` and `len(partition)` describe this rank's
+remaining samples and batches.
+
+The plan has constant retained state; iteration retains at most one batch of indices.
+`python -m arrayroute.benchmark_partition --output /tmp/rank-index-benchmark` measures
+large-domain rank planning and late resume, explicitly **not physical I/O throughput**.
+
 The implementation uses eight keyed BLAKE2b Feistel rounds and cycle walking, based on
 [Black and Rogaway's arbitrary-domain construction](https://www.cs.ucdavis.edu/~rogaway/papers/subset.pdf).
 It is a sampling primitive, not encryption, and is not a uniform draw from all possible
