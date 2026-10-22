@@ -100,3 +100,71 @@ def test_strided_output_is_released_without_cyclic_gc(tmp_path, sharded):
         if enabled:
             gc.enable()
         gc.collect()
+
+
+@pytest.mark.parametrize('selection', [
+    (slice(None, None, 2),) * 3,
+    (slice(1, 29, 3), slice(2, 31, 5), slice(3, 27, 7)),
+    (3, slice(None, None, 17), slice(2, 30, 19)),
+    (slice(1, 32, 31), 13, slice(2, 32, 11)),
+])
+def test_each_intersected_shard_is_visited_once_without_reordering_values(tmp_path, selection):
+    import itertools
+
+    values = np.arange(32**3, dtype='f4').reshape((32,) * 3)
+    path = tmp_path / 'field.zarr'
+    zarr.create_array(path, data=values, chunks=(4,) * 3, shards=(8,) * 3)
+    native = zarrista.Array.open(zarrista.store.FilesystemStore(str(path)))
+    visits, misses = [], []
+
+    class Observed:
+        def __getattr__(self, name):
+            return getattr(native, name)
+
+        def retrieve_subchunk(self, coordinates, *, shard_cache):
+            visits.append(tuple(coordinates))
+            if shard_cache.is_empty():
+                misses.append(tuple(c // 2 for c in coordinates))
+            return native.retrieve_subchunk(coordinates, shard_cache=shard_cache)
+
+    result = ArrayReader(ZarristaBackend(Observed())).read(selection)
+    assert result.tobytes() == values[selection].tobytes()
+    points = itertools.product(*(
+        [s] if isinstance(s, int) else range(*s.indices(32)) for s in selection))
+    expected_chunks = {tuple(p // 4 for p in point) for point in points}
+    expected_shards = {tuple(c // 2 for c in chunk) for chunk in expected_chunks}
+    assert len(visits) == len(expected_chunks) and set(visits) == expected_chunks
+    assert len(misses) == len(expected_shards) and set(misses) == expected_shards
+    assert misses == sorted(misses)
+
+
+def test_random_stride_phases_and_edge_shards_match_numpy(tmp_path):
+    shape = (7, 13, 11, 3)
+    rng = np.random.default_rng(817)
+    values = rng.integers(0, 2**32, size=shape, dtype='u4').view('f4')
+    path = tmp_path / 'field.zarr'
+    zarr.create_array(path, data=values, chunks=(2, 3, 2, 1), shards=(4, 6, 4, 3))
+    reader = ArrayReader(ZarristaBackend(
+        zarrista.Array.open(zarrista.store.FilesystemStore(str(path)))))
+    for _ in range(100):
+        selection = tuple(
+            int(rng.integers(-n, n)) if rng.random() < .25 else
+            slice(int(rng.integers(-n, n)), int(rng.integers(0, n + 1)),
+                  int(rng.integers(2, n + 3))) for n in shape)
+        assert reader.read(selection).tobytes() == values[selection].tobytes()
+
+
+def test_shard_region_iteration_stays_lazy_for_petabyte_shape():
+    import itertools
+
+    from arrayroute import ArraySpec, plan
+    from arrayroute.backends import _grid_regions
+
+    spec = ArraySpec((1 << 20, 1024, 1024, 256), (1, 32, 32, 32), 4)
+    assert spec.logical_bytes == 1 << 50
+    selection = plan(spec, (slice(None, None, 3),) * 4).selection
+    first = list(itertools.islice(_grid_regions(selection, (1, 128, 128, 128)), 3))
+    assert len(first) == 3
+    assert first[0] == (slice(0, 1, 3), slice(0, 128, 3), slice(0, 128, 3), slice(0, 128, 3))
+    assert first[1][-1] == slice(129, 256, 3)
+    assert first[2][-2] == slice(129, 256, 3)

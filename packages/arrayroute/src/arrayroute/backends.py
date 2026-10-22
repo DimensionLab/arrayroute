@@ -3,11 +3,32 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from typing import Any
 
 import numpy as np
 
 from .plan import ArraySpec, DecodeWindow, Selection, plan
+
+
+def _grid_regions(
+    selection: Selection, shape: tuple[int, ...], axis: int = 0, prefix: Selection = (),
+) -> Iterator[Selection]:
+    """Visit only intersected grid blocks, retaining the original stride phase."""
+    if axis == len(selection):
+        yield prefix
+        return
+    sel = selection[axis]
+    if isinstance(sel, int):
+        yield from _grid_regions(selection, shape, axis + 1, (*prefix, sel))
+        return
+    pos = sel.start
+    while pos < sel.stop:
+        end = min(sel.stop, (pos // shape[axis] + 1) * shape[axis])
+        yield from _grid_regions(
+            selection, shape, axis + 1, (*prefix, slice(pos, end, sel.step)),
+        )
+        pos += ((end - pos + sel.step - 1) // sel.step) * sel.step
 
 
 class ZarrBackend:
@@ -70,21 +91,23 @@ class ZarristaBackend:
         request = plan(self.spec, selection)
         result = np.empty(request.output_shape, dtype=self.dtype)
         cache = self.array.shard_cache() if self._partial_shards else None
-        shard_shape = self.array.chunk_shape([0] * self.array.ndim) if cache is not None else ()
-        active_shard = None
+        shard_shape = (
+            tuple(self.array.chunk_shape([0] * self.array.ndim)) if cache is not None else ()
+        )
+        shard_count = (
+            plan(ArraySpec(self.spec.shape, shard_shape, self.spec.itemsize),
+                 request.selection).chunks_touched if cache is not None else 0
+        )
+        one_chunk_per_shard = shard_count > 1 and shard_count == request.chunks_touched
 
-        def visit(recur, axis, sources, targets, strides):
-            nonlocal active_shard
+        def visit(recur, region, axis, sources, targets, strides):
             if axis == len(selection):
                 if cache is None:
                     value = self._contiguous(tuple(sources))
                 else:
-                    starts = [s if isinstance(s, int) else s.start for s in sources]
-                    shard = tuple(p // c for p, c in zip(starts, shard_shape, strict=True))
-                    if shard != active_shard:
-                        # Retain at most one index, and never reuse it across read calls.
+                    if one_chunk_per_shard:
                         cache.clear()
-                        active_shard = shard
+                    starts = [s if isinstance(s, int) else s.start for s in sources]
                     chunks = self.spec.chunks
                     coordinates = [p // c for p, c in zip(starts, chunks, strict=True)]
                     local = tuple(
@@ -96,17 +119,21 @@ class ZarristaBackend:
                         coordinates, shard_cache=cache))[local]
                 result[tuple(targets)] = value[tuple(strides)]
                 return
-            sel, chunk = request.selection[axis], self.spec.chunks[axis]
+            sel, chunk = region[axis], self.spec.chunks[axis]
             if isinstance(sel, int):
-                recur(recur, axis + 1, [*sources, sel], targets, strides)
+                recur(recur, region, axis + 1, [*sources, sel], targets, strides)
                 return
-            pos, output = sel.start, 0
+            pos = sel.start
+            original = request.selection[axis]
+            assert isinstance(original, slice)
+            output = (pos - original.start) // sel.step
             while pos < sel.stop:
                 end = min(sel.stop, (pos // chunk + 1) * chunk)
                 count = (end - pos + sel.step - 1) // sel.step
                 last = pos + (count - 1) * sel.step
                 recur(
                     recur,
+                    region,
                     axis + 1,
                     [*sources, slice(pos, last + 1)],
                     [*targets, slice(output, output + count)],
@@ -118,5 +145,11 @@ class ZarristaBackend:
         # The native reader supports unit strides only. Read each touched chunk once,
         # then gather within it; never read the skipped chunks of a bounding box.
         # Passing the callback avoids a closure cycle retaining result until cyclic GC.
-        visit(visit, 0, [], [], [])
+        if cache is None or shard_count <= 1 or one_chunk_per_shard:
+            visit(visit, request.selection, 0, [], [], [])
+        else:
+            for region in _grid_regions(request.selection, shard_shape):
+                # Finish each shard before discarding its index; retain no global inventory.
+                cache.clear()
+                visit(visit, region, 0, [], [], [])
         return result

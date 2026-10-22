@@ -54,7 +54,10 @@ not inherit this guarantee. Total decode work and amplification remain unchanged
 
 Zarrista strided reads gather only touched inner chunks. When partial shard decoding is
 available, the adapter reuses one shard index while gathering those chunks and discards
-it before moving to another shard or returning from the read. Index bytes and native
+it before moving to another shard or returning from the read. It completes all selected
+chunks within each shard before visiting the next, retaining the original selection's
+stride phase and output order. Shard regions are generated lazily without a global chunk
+inventory. Index bytes and native
 bookkeeping are additional to the read-buffer allowance; no field payload is cached by
 this mechanism. Reads after a completed external write create fresh indexes. Concurrent
 source mutation still requires snapshot isolation supplied by the caller. An outer
