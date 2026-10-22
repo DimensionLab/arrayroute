@@ -197,6 +197,20 @@ are synthetic scientific buffers, not solver output. OS caches are uncontrolled,
 byte estimates are not transport measurements, and engine thread budgets must be matched
 before using the results for a controlled comparison. See the report's method metadata.
 
+For a large engine comparison on a shared layout, select only the representation you
+intend to read instead of paying to materialize three copies:
+
+```sh
+python -m arrayroute.benchmark --root /data/sharded-study --create --create-only \
+  --frames 43691 --edge 128 --layouts sharded --writer zarrista
+```
+
+This materializes just over 1 TiB of logical float32 values in one sharded array; disk
+bytes depend on compression and filesystem allocation. It is a requested experiment
+size, not a previously measured throughput claim. All supported read engines can use
+the same array. Receipts record the selected layouts and actual writer concurrency.
+Invalid or duplicate layout choices fail before creating the output directory.
+
 The generator saves `materialization.json` before counting physical files. For very
 large fixtures, numerical verification can proceed independently of that inventory:
 

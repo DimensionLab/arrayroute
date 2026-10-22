@@ -11,6 +11,7 @@ import os
 import platform
 import random
 import time
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
@@ -26,12 +27,21 @@ def _digest(value: np.ndarray) -> str:
     return hashlib.sha256(value.tobytes()).hexdigest()
 
 
-def create_fixture(root: Path, *, frames: int, edge: int, writer: str = "zarr-python") -> dict:
+def create_fixture(
+    root: Path, *, frames: int, edge: int, writer: str = "zarr-python",
+    layouts: Sequence[str] = ("frame", "brick", "sharded"),
+) -> dict:
     import zarr
     from zarr.codecs import ZstdCodec
 
     if frames < 4 or edge < 32 or edge % 32:
         raise ValueError("Use at least 4 frames and an edge divisible by 32")
+    if not layouts or len(set(layouts)) != len(layouts) or set(layouts) - {
+        "frame", "brick", "sharded"
+    }:
+        raise ValueError("Choose unique layouts from frame, brick and sharded")
+    if writer not in {"zarr-python", "zarrista"}:
+        raise ValueError("Unknown fixture writer")
     root.mkdir(parents=True, exist_ok=False)
     shape = (frames, edge, edge, edge, 3)
     arrays = {}
@@ -40,6 +50,8 @@ def create_fixture(root: Path, *, frames: int, edge: int, writer: str = "zarr-py
         ("brick", (1, 32, 32, 32, 3), None),
         ("sharded", (1, 32, 32, 32, 3), (1, edge, edge, edge, 3)),
     ):
+        if name not in layouts:
+            continue
         arrays[name] = zarr.create_array(
             root / f"{name}.zarr",
             shape=shape,
@@ -57,15 +69,13 @@ def create_fixture(root: Path, *, frames: int, edge: int, writer: str = "zarr-py
             name: zarrista.Array.open(zarrista.store.FilesystemStore(str(root / f"{name}.zarr")))
             for name in arrays
         }
-    elif writer != "zarr-python":
-        raise ValueError("Unknown fixture writer")
 
     def write_frame(array, t, value):
         # Explicit time extent works identically in both engines.
         array[t : t + 1] = value.reshape((1, *value.shape))
 
     start = time.perf_counter()
-    with ThreadPoolExecutor(max_workers=3) as pool:
+    with ThreadPoolExecutor(max_workers=len(arrays)) as pool:
         for t in range(frames):
             # Controlled broadband synthetic field; no claim of a physical CFD solution.
             rng = np.random.default_rng(83491 + t)
@@ -82,6 +92,7 @@ def create_fixture(root: Path, *, frames: int, edge: int, writer: str = "zarr-py
                     "frames_written": t + 1,
                     "frames_total": frames,
                     "logical_bytes_per_layout": (t + 1) * value.nbytes,
+                    "selected_layouts": list(arrays),
                     "elapsed_s": time.perf_counter() - start,
                 }
                 temporary = root / "progress.tmp"
@@ -94,7 +105,8 @@ def create_fixture(root: Path, *, frames: int, edge: int, writer: str = "zarr-py
         "generation_seconds": time.perf_counter() - start,
         "kind": "deterministic broadband synthetic; not CFD; all values materialized",
         "writer": writer,
-        "concurrent_layout_writers": 3,
+        "concurrent_layout_writers": len(arrays),
+        "selected_layouts": list(arrays),
         "layouts": {},
     }
     # Numeric verification must not wait for a multi-million-object inventory.
@@ -299,13 +311,17 @@ def main() -> None:
     parser.add_argument("--frames", type=int, default=8)
     parser.add_argument("--edge", type=int, default=128)
     parser.add_argument("--writer", choices=["zarr-python", "zarrista"], default="zarr-python")
+    parser.add_argument("--layouts", nargs="+", choices=["frame", "brick", "sharded"],
+                        default=["frame", "brick", "sharded"],
+                        help="Materialize only these layouts; one copy can be read by all engines")
     parser.add_argument("--repeats", type=int, default=7)
     parser.add_argument("--create-only", action="store_true")
     parser.add_argument("--scan-engine", choices=["zarr-python", "tensorstore", "zarrista"])
     parser.add_argument("--scan-layout", choices=["frame", "brick", "sharded"], default="sharded")
     args = parser.parse_args()
     if args.create:
-        create_fixture(args.root, frames=args.frames, edge=args.edge, writer=args.writer)
+        create_fixture(args.root, frames=args.frames, edge=args.edge, writer=args.writer,
+                       layouts=args.layouts)
     if args.create_only:
         return
     if args.scan_engine:
