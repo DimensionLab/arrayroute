@@ -11,6 +11,7 @@ from typing import Any
 
 from .backends import DenseGatherBackend, TensorStoreBackend, ZarrBackend, ZarristaBackend
 from .budget import ReadBudget
+from .errors import UnsupportedReadPolicyError
 from .gather import ParallelGatherBackend
 from .plan import GatherWindow, Selection
 from .ranges import RangePolicy
@@ -66,7 +67,8 @@ class LocalReadSession:
                 or not 1 <= gather_workers <= 256):
             raise ValueError("Gather workers must be an integer from 1 to 256")
         if read_strategy in {"parallel", "bulk"} and engine != "zarrista":
-            raise ValueError("Parallel gathering currently requires the Zarrista engine")
+            raise UnsupportedReadPolicyError(
+                "Parallel gathering currently requires the Zarrista engine")
         if read_strategy not in {"parallel", "bulk"} and gather_workers != 4:
             raise ValueError("gather_workers requires the parallel or bulk read strategy")
         self.gather_workers = gather_workers
@@ -156,7 +158,8 @@ class LocalReadSession:
             backend = native
             if self.read_strategy in {"parallel", "bulk"}:
                 if not native._partial_shards:
-                    raise ValueError("Parallel gathering requires independently decodable shards")
+                    raise UnsupportedReadPolicyError(
+                        "Parallel gathering requires independently decodable shards")
                 backend = ParallelGatherBackend(
                     native, lambda: ZarristaBackend(array),
                     GatherWindow(tuple(array.chunk_shape([0] * array.ndim)), self.gather_workers,

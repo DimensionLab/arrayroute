@@ -16,7 +16,7 @@ import numpy as np
 
 from .concurrency import plan_concurrency
 from .execution import ProcessingCancelledError, ordered_map
-from .plan import Selection
+from .plan import ArraySpec, Selection
 from .reader import ArrayReader, ReadStats
 
 
@@ -113,34 +113,7 @@ def probe_reads(
         return time.perf_counter() >= deadline
 
     def run(count: int) -> list[dict]:
-        budget = total_buffer_bytes // count
-
-        def make_worker():
-            reader = make_reader(budget)
-            if reader.backend.spec != spec or reader.backend.dtype != dtype:
-                raise ValueError("Reader factory changed array metadata")
-            if reader.buffer_bytes != budget:
-                raise ValueError("Reader factory did not apply the assigned buffer budget")
-
-            def read(index: int) -> dict:
-                stats = ReadStats()
-                value = reader.read(normalized[index], stats=stats)
-                digest = hashlib.sha256()
-                # Bounded buffering also handles noncontiguous arrays without a full copy.
-                for block in np.nditer(value, flags=['external_loop', 'buffered', 'zerosize_ok'],
-                                       op_flags=['readonly'], order='C',
-                                       buffersize=max(1, 32768 // dtype.itemsize)):
-                    digest.update(cast(np.ndarray, block).tobytes())
-                return {'sha256': digest.hexdigest(), 'bytes': value.nbytes,
-                        'requests': stats.requests, 'read_seconds': stats.seconds,
-                        'read_strategies': stats.read_strategies,
-                        'gather_workers_peak': stats.gather_workers_peak}
-
-            return read
-
-        with ordered_map(make_worker, range(len(normalized)), workers=count,
-                         max_pending=count, cancelled=expired) as results:
-            return list(results)
+        return _run_reads(make_reader, normalized, total_buffer_bytes, count, spec, dtype, expired)
 
     try:
         reference = run(1)
@@ -174,3 +147,38 @@ def probe_reads(
         report['state'] = 'time-budget-reached'
     report['elapsed_seconds'] = time.perf_counter() - started
     return report
+
+
+def _run_reads(
+    make_reader: Callable[[int], ArrayReader], selections: Sequence[Selection],
+    total_buffer_bytes: int, count: int, spec: ArraySpec, dtype: np.dtype,
+    cancelled: Callable[[], bool],
+) -> list[dict]:
+    """Shared worker-owned read/hash loop for concurrency and cross-policy pilots."""
+    budget = total_buffer_bytes // count
+
+    def make_worker():
+        reader = make_reader(budget)
+        if reader.backend.spec != spec or reader.backend.dtype != dtype:
+            raise ValueError("Reader factory changed array metadata")
+        if reader.buffer_bytes != budget:
+            raise ValueError("Reader factory did not apply the assigned buffer budget")
+
+        def read(index: int) -> dict:
+            stats = ReadStats()
+            value = reader.read(selections[index], stats=stats)
+            digest = hashlib.sha256()
+            for block in np.nditer(value, flags=['external_loop', 'buffered', 'zerosize_ok'],
+                                   op_flags=['readonly'], order='C',
+                                   buffersize=max(1, 32768 // dtype.itemsize)):
+                digest.update(cast(np.ndarray, block).tobytes())
+            return {'sha256': digest.hexdigest(), 'bytes': value.nbytes,
+                    'requests': stats.requests, 'read_seconds': stats.seconds,
+                    'read_strategies': stats.read_strategies,
+                    'gather_workers_peak': stats.gather_workers_peak}
+
+        return read
+
+    with ordered_map(make_worker, range(len(selections)), workers=count,
+                     max_pending=count, cancelled=cancelled) as results:
+        return list(results)

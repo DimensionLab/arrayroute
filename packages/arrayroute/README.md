@@ -1192,3 +1192,50 @@ two-region decoded-buffer bound and never reserve from the parent reader's budge
 The ordinary factory still supplies the single-chunk partial reader. All workers
 are joined before returning or raising; bulk reads retain the same cache and
 streaming contracts as partial reads.
+
+### Compare policies on your own regions
+
+`compare_reads` compares reader engines and strategies as well as outer worker counts.
+Each policy is a worker-owned reader factory with an assigned share of one total
+buffer allowance. It is usable independently of Frontier, and custom backends may
+participate without changing the comparison code.
+
+```python
+from arrayroute.compare import ReadPolicy, compare_reads
+from arrayroute.settings import ReadSettings
+
+settings = [ReadSettings(), ReadSettings("zarrista", "bulk", gather_workers=8),
+            ReadSettings("tensorstore", tensorstore_threads=8)]
+
+def factory(configuration):
+    return lambda budget: configuration.session(budget).open("simulation.zarr", "velocity")
+
+report = compare_reads(
+    factory(settings[0]),
+    [ReadPolicy(s.name, factory(s)) for s in settings],
+    [(t, slice(None, None, 8), slice(None, None, 8), slice(None, None, 8), slice(None))
+     for t in (0, 2, 4, 6)],
+    worker_counts=[1, 2], total_buffer_bytes=64 << 20,
+    max_output_bytes=1 << 30, time_budget_seconds=60, repeats=3,
+)
+if report["state"] == "completed":
+    print(report["recommendation"])
+```
+
+Keep the source fixed during the pilot. One sequential reference establishes SHA-256
+values, then all policy/worker/repetition combinations are shuffled together. Every
+result must match the reference byte for byte. Shape and dtype must match across
+policies; chunk layouts may differ. A missing optional dependency or an explicit
+`UnsupportedReadPolicyError` is recorded as skipped. Other failures abort the pilot.
+
+The output cap includes reference and repeated selected outputs. It does not limit
+compressed bytes fetched or chunks decoded. Memory admission covers read buffers,
+not process RSS, native caches or codec scratch. TensorStore thread settings apply
+per native pool per outer reader; other engines retain process-level thread settings.
+
+The recommendation minimizes observed median setup/read/hash/teardown wall time.
+Reports retain CPU time, ranges across repetitions, actual execution strategies and
+admitted gather concurrency. They are local measurements, not cold-storage or training
+throughput predictions. Test the selected configuration on held-out regions before
+using it for a large job. The cooperative deadline joins in-flight reads; incomplete
+pilots retain diagnostics and never recommend a configuration.
