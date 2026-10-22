@@ -6,12 +6,13 @@ from __future__ import annotations
 import time
 from collections.abc import Callable, Generator, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Protocol
 
 import numpy as np
 
+from .budget import ReadBudget
 from .plan import ArraySpec, ReadPlan, Selection, Tile, plan, tiles
 
 
@@ -31,11 +32,15 @@ class ReadStats:
 
 
 class ArrayReader:
-    def __init__(self, backend: Backend, *, buffer_bytes: int = 128 << 20):
+    def __init__(
+        self, backend: Backend, *, buffer_bytes: int = 128 << 20,
+        shared_budget: ReadBudget | None = None,
+    ):
         if buffer_bytes < 1:
             raise ValueError("buffer_bytes must be positive")
         self.backend = backend
         self.buffer_bytes = buffer_bytes
+        self.shared_budget = shared_budget
 
     def plan(self, selection: Selection) -> ReadPlan:
         return plan(self.backend.spec, selection)
@@ -50,21 +55,33 @@ class ArrayReader:
         for tile in tiles(self.backend.spec, selection, buffer_bytes=self.buffer_bytes):
             if cancelled is not None and cancelled():
                 raise InterruptedError("Array read cancelled")
-            start = time.perf_counter()
-            value = self.backend.read(tile.plan.selection)
-            if value.shape != tile.plan.output_shape or value.dtype != self.backend.dtype:
-                raise ValueError("Backend returned an unexpected shape or dtype")
-            if stats is not None:
-                stats.requests += 1
-                stats.seconds += time.perf_counter() - start
-                stats.output_bytes += value.nbytes
-                stats.decoded_bytes_upper_bound += tile.plan.decoded_bytes_upper_bound
-            yield tile, value
-            # Do not retain the previous buffer while requesting the next one.
-            del value
+            reservation = (
+                self.shared_budget.reserve(tile.plan.buffer_bytes_upper_bound, cancelled=cancelled)
+                if self.shared_budget is not None else nullcontext()
+            )
+            with reservation:
+                start = time.perf_counter()
+                value = self.backend.read(tile.plan.selection)
+                if value.shape != tile.plan.output_shape or value.dtype != self.backend.dtype:
+                    raise ValueError("Backend returned an unexpected shape or dtype")
+                if stats is not None:
+                    stats.requests += 1
+                    stats.seconds += time.perf_counter() - start
+                    stats.output_bytes += value.nbytes
+                    stats.decoded_bytes_upper_bound += tile.plan.decoded_bytes_upper_bound
+                yield tile, value
+                # Release the previous buffer before returning its reservation.
+                del value
 
     def read(self, selection: Selection, *, stats: ReadStats | None = None) -> np.ndarray:
         request = self.plan(selection)
+        if self.shared_budget is not None:
+            # Admit the entire materialization before allocating its output. Reserving
+            # outputs separately from tiles can deadlock concurrent materializations.
+            amount = min(request.buffer_bytes_upper_bound, self.buffer_bytes)
+            with self.shared_budget.reserve(amount):
+                return ArrayReader(self.backend, buffer_bytes=self.buffer_bytes).read(
+                    selection, stats=stats)
         if request.buffer_bytes_upper_bound <= self.buffer_bytes:
             chunks = self.stream(selection, stats=stats)
             if request.output_bytes:
@@ -99,6 +116,14 @@ class ArrayReader:
         The cancellation callback must be thread-safe. Release each value before
         advancing if retaining a previous tile would exceed the consumer's budget.
         """
+        if self.shared_budget is not None:
+            # Both slots remain owned until context exit, even when the worker has
+            # advanced its generator while the consumer still holds the previous tile.
+            with self.shared_budget.reserve(self.buffer_bytes, cancelled=cancelled):
+                reader = ArrayReader(self.backend, buffer_bytes=self.buffer_bytes)
+                with reader.prefetch(selection, stats=stats, cancelled=cancelled) as output:
+                    yield output
+            return
         budget = self.buffer_bytes // 2
         if budget < 1:
             raise ValueError("Prefetch requires a budget for two read slots")

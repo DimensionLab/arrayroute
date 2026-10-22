@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .backends import TensorStoreBackend, ZarrBackend, ZarristaBackend
+from .budget import ReadBudget
 from .plan import Selection
 from .ranges import RangePolicy
 from .reader import ArrayReader, Backend, ReadStats
@@ -46,6 +47,7 @@ class LocalReadSession:
         tensorstore_threads: int = 8,
         immutable: bool = False,
         range_policy: RangePolicy | None = None,
+        read_budget: ReadBudget | None = None,
     ):
         if not isinstance(immutable, bool):
             raise TypeError("immutable must be a boolean")
@@ -66,6 +68,7 @@ class LocalReadSession:
                                          or not isinstance(range_policy, RangePolicy)):
             raise ValueError("range_policy requires Zarr-Python and an explicit RangePolicy")
         self.range_policy = range_policy
+        self.read_budget = read_budget
         self.engine = engine
         self.buffer_bytes = buffer_bytes
         self.max_open_arrays = max_open_arrays
@@ -82,6 +85,8 @@ class LocalReadSession:
         self._context = None
 
     def __getstate__(self) -> dict:
+        if self.read_budget is not None:
+            raise TypeError('Shared budgets are in-process only; create a new pool after spawn')
         if self._group is not None:
             raise TypeError("Shared read sessions are in-process only; create a group after spawn")
         return {**vars(self), "_readers": OrderedDict(), "_context": None}
@@ -135,7 +140,8 @@ class LocalReadSession:
             backend = ZarristaBackend(
                 zarrista.Array.open(zarrista.store.FilesystemStore(key[0]), path="/" + key[1])
             )
-        reader = ArrayReader(backend, buffer_bytes=self.buffer_bytes)
+        reader = ArrayReader(
+            backend, buffer_bytes=self.buffer_bytes, shared_budget=self.read_budget)
         while len(self._readers) >= self.max_open_arrays:
             self._readers.popitem(last=False)
         self._readers[key] = reader
@@ -206,13 +212,14 @@ class TensorStoreReadGroup:
 
     def session(
         self, *, buffer_bytes: int = 128 << 20, max_open_arrays: int = 64,
+        read_budget: ReadBudget | None = None,
     ) -> LocalReadSession:
         """Create a worker-owned session using this group's aggregate native budget."""
         self._check_process()
         session = LocalReadSession(
             "tensorstore", buffer_bytes=buffer_bytes, max_open_arrays=max_open_arrays,
             tensorstore_cache_bytes=self.cache_bytes, tensorstore_threads=self.threads,
-            immutable=self.immutable,
+            immutable=self.immutable, read_budget=read_budget,
         )
         session._group = self
         return session

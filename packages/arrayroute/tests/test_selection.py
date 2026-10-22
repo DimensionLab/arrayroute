@@ -179,12 +179,12 @@ def test_native_backends_match_numpy_strides_and_exceptional_bits(tmp_path, engi
         assert reader.read(selection).tobytes() == original[selection].tobytes()
 
 
-def test_outer_shard_codec_is_charged_as_whole_shard(tmp_path):
-    zarrista = pytest.importorskip("zarrista")
+@pytest.mark.parametrize('engine', ['zarr-python', 'zarrista'])
+def test_outer_shard_codec_is_charged_as_whole_shard(tmp_path, engine):
     import zarr
     from zarr.codecs import BytesCodec, ShardingCodec, ZstdCodec
 
-    from arrayroute.backends import ZarristaBackend
+    from arrayroute.session import LocalReadSession
 
     path = tmp_path / "outer.zarr"
     with pytest.warns(UserWarning, match="disables partial"):
@@ -197,7 +197,29 @@ def test_outer_shard_codec_is_charged_as_whole_shard(tmp_path):
             compressors=[ZstdCodec()],
         )
     array[:] = 1
-    backend = ZarristaBackend(zarrista.Array.open(zarrista.store.FilesystemStore(str(path))))
+    backend = LocalReadSession(engine).open(path, '').backend
     assert backend.spec.chunks == (16, 16)
     with pytest.raises(MemoryError):
         ArrayReader(backend, buffer_bytes=512).read((0, 0))
+    assert ArrayReader(backend, buffer_bytes=2048).read((0, 0)) == np.float32(1)
+
+
+@pytest.mark.parametrize('engine', ['zarr-python', 'zarrista'])
+def test_outer_transpose_preserves_axes_and_charges_whole_shard(tmp_path, engine):
+    import zarr
+    from zarr.codecs import BytesCodec, ShardingCodec, TransposeCodec
+
+    from arrayroute.session import LocalReadSession
+
+    path = tmp_path / 'transposed.zarr'
+    with pytest.warns(UserWarning, match='disables partial'):
+        array = zarr.create_array(path, shape=(32, 64), chunks=(16, 32), dtype='f4',
+            filters=[TransposeCodec(order=(1, 0))], compressors=[],
+            serializer=ShardingCodec(chunk_shape=(8, 4), codecs=[BytesCodec()]))
+    values = np.arange(32 * 64, dtype='f4').reshape(32, 64)
+    array[:] = values
+    backend = LocalReadSession(engine).open(path, '').backend
+    assert backend.spec.chunks == (16, 32)
+    with pytest.raises(MemoryError):
+        ArrayReader(backend, buffer_bytes=1024).read((7, 25))
+    assert ArrayReader(backend, buffer_bytes=4096).read((7, 25)) == values[7, 25]

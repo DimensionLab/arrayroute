@@ -16,7 +16,14 @@ class ZarrBackend:
         self.dtype = np.dtype(array.dtype)
         if self.dtype.hasobject or self.dtype.itemsize == 0:
             raise TypeError("A fixed-size, non-object dtype is required")
-        self.spec = ArraySpec(tuple(array.shape), tuple(array.chunks), self.dtype.itemsize)
+        chunks = tuple(array.chunks)
+        metadata = getattr(array, 'metadata', None)
+        codecs = getattr(metadata, 'codecs', ())
+        if (metadata is not None and getattr(metadata, 'sharding_codec', None) is not None
+                and len(codecs) != 1):
+            # Outer transforms/compressors disable partial shard decoding in Zarr.
+            chunks = tuple(metadata.chunk_grid.chunk_shape)
+        self.spec = ArraySpec(tuple(array.shape), chunks, self.dtype.itemsize)
 
     def read(self, selection: Selection) -> np.ndarray:
         return np.asarray(self.array[selection])
@@ -40,7 +47,7 @@ class ZarristaBackend:
         self.dtype = np.dtype(array.metadata["data_type"])
         chunks = array.effective_subchunk_shape or array.chunk_shape([0] * array.ndim)
         codecs = array.metadata["codecs"]
-        outer_codec = any(c["name"] == "sharding_indexed" for c in codecs[:-1])
+        outer_codec = len(codecs) != 1 and any(c["name"] == "sharding_indexed" for c in codecs)
         self._partial_shards = array.is_sharded and not outer_codec
         if outer_codec:
             # A codec outside the shard requires decoding the complete shard.

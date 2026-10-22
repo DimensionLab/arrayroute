@@ -1008,3 +1008,51 @@ from 128 MiB to 4 MiB, with roughly 3–8% more time for the delayed consumer in
 8 MiB sharded-array control had similar read time with matched coalescing. Forbidding
 extra bytes reduced fetched bytes but increased requests and wall time. Measure your
 own access patterns before selecting a stricter policy.
+
+## Share a decode/output budget across readers
+
+`ReadBudget` provides process-local admission control for independent reader threads.
+Use one pool for analysis, visualization or preprocessing tasks that run concurrently:
+
+```python
+from contextlib import closing
+from arrayroute.budget import ReadBudget
+from arrayroute.session import LocalReadSession
+
+budget = ReadBudget(256 << 20)
+
+def inspect_field(path, field, selection):
+    # Each worker owns its session; only the admission budget is shared.
+    session = LocalReadSession("zarr-python", buffer_bytes=64 << 20, read_budget=budget)
+    with closing(session.open(path, field).stream(selection)) as source:
+        for tile, values in source:
+            consume(tile.destination, values)
+            del values
+
+# Submit inspect_field calls to your own thread pool.
+print(budget.snapshot())
+```
+
+Streaming reservations cover the planned output and decoded chunks until the consumer
+advances or closes the generator. Materialized `read()` reserves before allocating the
+output and releases on return; arrays subsequently held by the caller are additional.
+`prefetch()` reserves both slots for its entire context, because a worker can advance
+while its consumer still holds the earlier tile. Larger reservations wait FIFO and
+cannot be repeatedly bypassed by smaller reads. Cancellation while waiting is supported;
+already-running native I/O still follows the backend's cancellation behavior.
+
+This is a conservative **planned-buffer** budget. It does not include compressed inputs,
+transport copies, native caches, codec scratch, metadata or caller-retained arrays, and
+does not enforce process RSS. The planner counts all chunks touched even for engines
+that decode them one at a time. A smaller budget can therefore throttle an efficient
+streaming engine unnecessarily. Keep enough room for a decoded chunk and measure the
+memory/throughput curve for your data before choosing a limit.
+
+Construct the pool after spawning each process; it cannot be pickled or reused after
+fork. Reservations cannot be nested in one thread. Close the current stream before
+starting another on that thread, or materialize a result and treat it as caller-owned
+memory. Source data must remain unchanged during the operation. As with ordinary
+sessions, mutable readers and statistics must not be shared between worker threads.
+For TensorStore, `TensorStoreReadGroup.session(read_budget=budget)` composes admission
+with shared native cache/thread controls. The cache soft limit is still separate from
+the planned output/decoded allowance.
