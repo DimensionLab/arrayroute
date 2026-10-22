@@ -958,3 +958,53 @@ isolation for a hard deadline. Partial pilots never recommend a worker count. Na
 caches, codec scratch and up to 64 KiB hash scratch per active worker are additional to
 the read-buffer allowance. Source bytes are never written. The reference checks read
 consistency; it does not establish scientific ground truth or a storage snapshot.
+
+## Bound range batches for a slow consumer
+
+`arrayroute.ranges` plans known byte ranges and streams completion-order views from an
+async callback. It depends on no storage provider. Each view carries its original input
+index; input offsets are half-open. Inputs must remain unchanged during a read.
+
+```python
+from arrayroute.ranges import RangePolicy, read_ranges
+
+policy = RangePolicy(
+    max_request_bytes=1 << 20, max_inflight_bytes=4 << 20,
+    max_gap_bytes=4096, max_extra_bytes=65536, concurrency=4,
+)
+# fetch(start, stop) asynchronously returns exactly those bytes from one object.
+async for batch in read_ranges(fetch, [(0, 65536), (69632, 131072)], policy=policy):
+    for input_index, view in batch.parts:
+        consume(input_index, view)  # Must not retain the view for the stated live-byte bound.
+    del view, batch
+```
+
+Scheduled tasks, completed results and the current yielded batch share the byte budget.
+The consumer must release views before advancing. Transport copies, retained decoder
+inputs, metadata and output arrays remain additional; this is not a process RAM cap.
+On failure or explicit `aclose()`, pending tasks are cancelled and awaited. Use
+`contextlib.aclosing` if a consumer may stop early. The callback must handle its own
+transport cleanup; blocking native I/O cannot be forcibly interrupted.
+
+The greedy planner bounds merged request size, bridged gaps, total extra fetched bytes
+(including repeated overlap), and range count. It rejects oversized ranges before I/O;
+split those explicitly. It may reject overlapping inputs where a different partition
+could fit. It does not claim globally optimal packing.
+
+For Zarr-Python 3.3+ partial-shard reads, wrap a store with
+`arrayroute.zarr_ranges.BoundedRangeStore(store, policy=policy)`, or pass `range_policy`
+to `LocalReadSession("zarr-python", range_policy=policy)`. Upstream per-array limits
+can further tighten the policy. No process-global Zarr setting changes. Ordinary `get`
+calls, including metadata and full shards, are unchanged. Each range batch has a
+separate allowance, so concurrent shards multiply it. Synchronous range calls return
+all results together and reject a plan whose total fetched bytes exceeds the allowance.
+Unknown-length range batches are rejected. Older Zarr versions fail explicitly when
+this optional adapter is constructed; the provider-neutral scheduler still works.
+
+Zarr already coalesces reads by default. This adapter adds backpressure and a total
+extra-byte budget; it is not universally faster. In a local 128-request control,
+both implementations returned identical 128 MiB; live scheduler payload decreased
+from 128 MiB to 4 MiB, with roughly 3–8% more time for the delayed consumer in two passes. A real
+8 MiB sharded-array control had similar read time with matched coalescing. Forbidding
+extra bytes reduced fetched bytes but increased requests and wall time. Measure your
+own access patterns before selecting a stricter policy.

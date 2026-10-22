@@ -11,6 +11,7 @@ from typing import Any
 
 from .backends import TensorStoreBackend, ZarrBackend, ZarristaBackend
 from .plan import Selection
+from .ranges import RangePolicy
 from .reader import ArrayReader, Backend, ReadStats
 
 
@@ -44,6 +45,7 @@ class LocalReadSession:
         tensorstore_cache_bytes: int = 0,
         tensorstore_threads: int = 8,
         immutable: bool = False,
+        range_policy: RangePolicy | None = None,
     ):
         if not isinstance(immutable, bool):
             raise TypeError("immutable must be a boolean")
@@ -60,6 +62,10 @@ class LocalReadSession:
             raise ValueError("Positive buffer, handle and thread limits are required; cache >= 0")
         if engine != "tensorstore" and tensorstore_cache_bytes:
             raise ValueError("tensorstore_cache_bytes requires the tensorstore engine")
+        if range_policy is not None and (engine != "zarr-python"
+                                         or not isinstance(range_policy, RangePolicy)):
+            raise ValueError("range_policy requires Zarr-Python and an explicit RangePolicy")
+        self.range_policy = range_policy
         self.engine = engine
         self.buffer_bytes = buffer_bytes
         self.max_open_arrays = max_open_arrays
@@ -92,7 +98,15 @@ class LocalReadSession:
         if self.engine == "zarr-python":
             import zarr
 
-            backend = ZarrBackend(zarr.open_array(str(Path(key[0]) / key[1]), mode="r"))
+            zarr_store: Any = str(Path(key[0]) / key[1])
+            if self.range_policy is not None:
+                from zarr.storage import LocalStore
+
+                from .zarr_ranges import BoundedRangeStore
+
+                zarr_store = BoundedRangeStore(LocalStore(zarr_store, read_only=True),
+                                               policy=self.range_policy)
+            backend = ZarrBackend(zarr.open_array(zarr_store, mode="r"))
         elif self.engine == "tensorstore":
             import tensorstore as ts
 
