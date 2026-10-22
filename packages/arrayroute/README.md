@@ -167,6 +167,36 @@ and cross-process reuse. Clearing one session drops its handles while preserving
 group's native cache. To refresh changed inputs, release all old sessions and construct
 a new group; `immutable=True` remains a caller assertion, not snapshot isolation.
 
+## Plan reader concurrency before a pilot
+
+More workers divide a fixed memory allowance into smaller buffers. That can turn one
+full-region read into many tiled requests. Inspect the tradeoff using metadata only:
+
+```python
+from arrayroute import ArraySpec
+from arrayroute.concurrency import plan_concurrency
+
+spec = ArraySpec((43691, 128, 128, 128, 3), (1, 32, 32, 32, 3), 4)
+options = plan_concurrency(
+    spec, (0, slice(None), slice(None), slice(None), slice(None)),
+    total_buffer_bytes=256 << 20, max_workers=8,
+)
+for choice in options.candidates:
+    print(choice.workers, choice.materialization, choice.requests_per_value_lower_bound)
+```
+
+For this layout, a frame needs 48 MiB for output plus the decoded-chunk estimate.
+Four or five readers can each issue one full-frame request; eight readers need eight
+tile requests per frame. Candidates include powers of two and the untiled boundary.
+Benchmark the candidates on the intended storage; this is not a throughput prediction.
+For variable-size samples, plan the largest selected shape, or plan each size bucket.
+
+Planning does not read values or enumerate the dataset. Tile counts stop after a
+bounded prefix and report a lower bound when `request_count_exact` is false. A selection
+whose output cannot fit is marked `stream-required`; a decoder chunk that cannot fit
+is marked `chunk-too-large`. Cache, decoder scratch, encoded transport and values retained
+outside the reader are additional memory. The plan assumes one active value per reader.
+
 ## Read remote arrays
 
 Install the optional `tensorstore` extra to read immutable Zarr v3 arrays over HTTP or
