@@ -812,8 +812,9 @@ from schema 1. Serialized cache/session objects reopen in spawned workers.
 Capacity is DiskCache's approximate database-plus-payload volume after eviction.
 WAL, filesystem bookkeeping, concurrent writes and temporary files are additional;
 use a filesystem quota when a strict disk bound is needed. Entries larger than
-`max_entry_bytes` bypass caching. Cache hits allocate one output array; miss serialization
-can require two additional output-sized buffers beyond the reader's budget. Backend
+`max_entry_bytes` bypass caching. Cache hits allocate one output array. Cold fills hash
+and stream contiguous source arrays without serialized payload copies; a non-contiguous
+source requires one contiguous copy. Native/backend scratch space is additional. Backend
 `stats` distinguish hits, misses, bypasses, corruptions, hit bytes and source bytes;
 these are tile counts/bytes, not compressed network-transfer measurements. Opening an
 array can still fetch its metadata even when all requested tiles are cached.

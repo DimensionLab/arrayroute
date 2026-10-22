@@ -77,6 +77,47 @@ def test_identity_change_cannot_reuse_stale_data(tmp_path, change):
     cache.close()
 
 
+@pytest.mark.parametrize("strided", [False, True])
+def test_large_binary_payload_preserves_bits_across_stream_chunks(tmp_path, strided):
+    values = np.random.default_rng(17).standard_normal((1536, 1536)).astype(">f4")
+    if strided:
+        values = values[::-1, ::-1]
+
+    class BorrowedSource(Source):
+        def read(self, selection):
+            self.calls += 1
+            if self.fail:
+                raise RuntimeError("Origin unavailable")
+            return self.value[selection]
+
+    source = BorrowedSource(values)
+    cache = open_cache(tmp_path, capacity=32 << 20, entry=12 << 20)
+    backend = cache.backend(source, identity())
+    selection = (slice(None), slice(None))
+    expected = hashlib.sha256(values.tobytes()).digest()
+    backend.read(selection)
+    source.fail = True
+    result = backend.read(selection)
+    assert result.dtype == values.dtype
+    assert hashlib.sha256(result.tobytes()).digest() == expected
+    result[:] = 0
+    assert hashlib.sha256(backend.read(selection).tobytes()).digest() == expected
+    assert source.calls == 1
+    cache.close()
+
+
+def test_cache_writer_rejects_arbitrary_objects_and_streams(tmp_path, monkeypatch):
+    import io
+
+    cache = open_cache(tmp_path)
+    monkeypatch.setattr(pickle, "dumps", lambda *a, **kw: pytest.fail("pickle executed"))
+    for value, read in [(object(), False), (b"raw", False), (io.BytesIO(b"raw"), True)]:
+        with pytest.raises(ValueError, match="bounded tile streams"):
+            cache._cache.set("untrusted", value, read=read)
+    assert len(cache._cache) == 0
+    cache.close()
+
+
 @pytest.mark.parametrize("corruption", ["truncated", "flipped", "oversize", "pickle-mode"])
 def test_corrupt_entries_are_reloaded_without_pickle(tmp_path, corruption, monkeypatch):
     source = Source(np.arange(256, dtype=np.float32))

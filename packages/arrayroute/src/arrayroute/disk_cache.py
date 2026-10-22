@@ -36,6 +36,28 @@ class CacheCorruptionError(ValueError):
     """A cache entry cannot be trusted; reload it from the immutable source."""
 
 
+class _TilePayload:
+    """Synchronous bounded buffer views for DiskCache's binary stream writer."""
+
+    def __init__(self, key: str, value: np.ndarray):
+        self.payload = memoryview(np.ascontiguousarray(value)).cast("B")
+        self.header = _MAGIC + _digest(key, self.payload)
+        self.size = len(self.header) + len(self.payload)
+        self.offset = 0
+
+    def read(self, size: int) -> bytes | memoryview:
+        if size <= 0:
+            raise ValueError("Tile stream reads require a positive size")
+        if self.offset < _HEADER:
+            end = min(_HEADER, self.offset + size)
+            chunk = self.header[self.offset:end]
+        else:
+            end = min(self.size, self.offset + size)
+            chunk = self.payload[self.offset - _HEADER:end - _HEADER]
+        self.offset = end
+        return chunk
+
+
 class _BytesDisk(Disk):
     """Never serialize or deserialize Python objects in the tile cache."""
 
@@ -54,9 +76,10 @@ class _BytesDisk(Disk):
         return key
 
     def store(self, value, read, key=UNKNOWN):
-        if not isinstance(value, bytes) or read or len(value) > self.max_payload_bytes:
-            raise ValueError("Tile cache accepts bounded bytes only")
-        return super().store(value, False, key)
+        if (type(value) is not _TilePayload or not read or value.offset != 0
+                or value.size > self.max_payload_bytes):
+            raise ValueError("Tile cache accepts fresh bounded tile streams only")
+        return super().store(value, True, key)
 
     def remove(self, file_path):
         root = Path(self._directory).resolve()
@@ -202,8 +225,8 @@ class CachedBackend:
 
     Own the source backend and stats in one worker. Tiles returned to callers are
     writable arrays; caller mutations never alter retained values. Hits read directly
-    into their output array and hash it in place. Miss serialization needs up to two
-    extra output-sized buffers beyond the source reader's budget. The max-entry limit
+    into their output array and hash it in place. Misses stream source arrays without
+    serialized payload copies; non-contiguous arrays need one contiguous copy. The max-entry limit
     bounds each cached payload, not overall process RSS.
     Overlapping selections with different bounds are different entries.
     """
@@ -275,8 +298,6 @@ class CachedBackend:
             raise ValueError("Source returned an unexpected tile shape or dtype")
         self.stats.source_bytes += value.nbytes
         if cache_value:
-            payload = np.ascontiguousarray(value).tobytes()
-            digest = _digest(key, payload)
-            self.cache._cache.set(key, _MAGIC + digest + payload)
+            self.cache._cache.set(key, _TilePayload(key, value), read=True)
             self.cache._cache.cull()
         return value
