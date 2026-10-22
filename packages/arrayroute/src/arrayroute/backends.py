@@ -65,7 +65,7 @@ class ZarristaBackend:
         shard_shape = self.array.chunk_shape([0] * self.array.ndim) if cache is not None else ()
         active_shard = None
 
-        def visit(axis, sources, targets, strides):
+        def visit(recur, axis, sources, targets, strides):
             nonlocal active_shard
             if axis == len(selection):
                 if cache is None:
@@ -90,14 +90,15 @@ class ZarristaBackend:
                 return
             sel, chunk = request.selection[axis], self.spec.chunks[axis]
             if isinstance(sel, int):
-                visit(axis + 1, [*sources, sel], targets, strides)
+                recur(recur, axis + 1, [*sources, sel], targets, strides)
                 return
             pos, output = sel.start, 0
             while pos < sel.stop:
                 end = min(sel.stop, (pos // chunk + 1) * chunk)
                 count = (end - pos + sel.step - 1) // sel.step
                 last = pos + (count - 1) * sel.step
-                visit(
+                recur(
+                    recur,
                     axis + 1,
                     [*sources, slice(pos, last + 1)],
                     [*targets, slice(output, output + count)],
@@ -108,5 +109,6 @@ class ZarristaBackend:
 
         # The native reader supports unit strides only. Read each touched chunk once,
         # then gather within it; never read the skipped chunks of a bounding box.
-        visit(0, [], [], [])
+        # Passing the callback avoids a closure cycle retaining result until cyclic GC.
+        visit(visit, 0, [], [], [])
         return result

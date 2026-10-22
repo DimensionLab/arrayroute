@@ -75,3 +75,28 @@ def test_outer_shard_codec_strides_use_whole_shard_budget(tmp_path):
     selection = (slice(1, 32, 3), slice(2, 32, 4))
     reader = ArrayReader(backend, buffer_bytes=2048)
     assert reader.read(selection).tobytes() == values[selection].tobytes()
+
+
+@pytest.mark.parametrize('sharded', [False, True])
+def test_strided_output_is_released_without_cyclic_gc(tmp_path, sharded):
+    import gc
+    import weakref
+
+    path = tmp_path / 'field.zarr'
+    options = {'shards': (8, 8)} if sharded else {}
+    zarr.create_array(path, data=np.arange(256, dtype='f4').reshape(16, 16),
+                      chunks=(4, 4), **options)
+    native = zarrista.Array.open(zarrista.store.FilesystemStore(str(path)))
+    reader = ArrayReader(ZarristaBackend(native), buffer_bytes=1 << 20)
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        for _ in range(3):
+            output = reader.read((slice(None, None, 2), slice(None, None, 2)))
+            reference = weakref.ref(output)
+            del output
+            assert reference() is None
+    finally:
+        if enabled:
+            gc.enable()
+        gc.collect()
