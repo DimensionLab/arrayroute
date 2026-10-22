@@ -1264,3 +1264,70 @@ admitted gather concurrency. They are local measurements, not cold-storage or tr
 throughput predictions. Test the selected configuration on held-out regions before
 using it for a large job. The cooperative deadline joins in-flight reads; incomplete
 pilots retain diagnostics and never recommend a configuration.
+
+### Choose a cache policy from your own workload
+
+`TraceRecorder` observes exact array selections without saving field values. Wrap
+the **outermost** backend so existing cache hits are included. Choose a short,
+representative serial pilot with repeated accesses and a later validation segment:
+
+```python
+from arrayroute import ArrayReader
+from arrayroute.cache_policy import TraceRecorder, compare_cache_policies
+from arrayroute.session import LocalReadSession
+
+source = LocalReadSession("tensorstore").open("simulation.zarr", "velocity")
+capture = TraceRecorder(max_events=10_000)
+reader = ArrayReader(capture.backend(
+    source.backend, identity="dataset-revision-42:velocity:physical-m/s-v1",
+))
+for epoch in range(4):
+    for frame in range(16):
+        velocity = reader.read((frame, slice(None), slice(None), slice(None), slice(None)))
+        # Use velocity in the same preparation/training/inspection loop being evaluated.
+
+trace = capture.snapshot()
+trace.save("velocity-access.json")
+report = compare_cache_policies(
+    trace, capacities_bytes=(120 << 20, 240 << 20),
+    max_entry_bytes=32 << 20, training_reads=32, entry_overhead_bytes=40,
+)
+for row in report["rows"]:
+    print(row["capacity_bytes"], row["recommendation"], row["recommendation_status"])
+```
+
+The source identity must include its immutable revision and representation, including
+unit conversion and preprocessing. Do not reuse one identity for changing content.
+Source metadata and selections are hashed; values, URLs and credentials are not
+written into the trace. Hashes and access patterns remain sensitive metadata.
+
+Compare saved traces without rereading the dataset:
+
+```sh
+python -m arrayroute.cache_policy velocity-access.json \
+  --capacity-bytes 125829120 --capacity-bytes 251658240 \
+  --max-entry-bytes 33554432 --training-reads 32 --entry-overhead-bytes 40 \
+  --output cache-policy.json
+```
+
+For each capacity, the comparison selects `none`, `lru` or `retain` using only the
+training prefix. It minimizes decoded source bytes, then payload write bytes.
+Cache state continues into validation. A training winner that regresses against
+LRU on the held-out suffix receives no recommendation. Ties prefer no cache, then
+LRU. Reports retain every policy's training and validation counters, not only the
+winner. A first-pass-only training prefix usually cannot establish cache benefit.
+
+Capacities are **usable payload plus declared per-entry overhead**, not the disk
+quota passed to `TileCache`. Reserve database, WAL and filesystem space separately.
+The default entry overhead is zero; 40 bytes models the current tile header only.
+Replay does not model compressed transfer sizes, source latency, eviction batching,
+filesystem contention or decoder caches. Verify the candidate with actual reads
+before applying it. The CLI does not change a cache or install settings.
+
+Recording is optional, process-local and bounded (100,000 events by default,
+1,000,000 maximum). Failed or truncated captures cannot be analyzed as complete
+pilots. Concurrent callers are captured in invocation order but receive no policy
+recommendation: serial replay cannot predict publication or single-flight behavior.
+Take a snapshot after outstanding reads finish. Saved JSON uses private permissions,
+bounded input size and atomic no-overwrite publication; it contains no executable
+factories. The recorder and analysis require only ArrayRoute's base dependencies.
