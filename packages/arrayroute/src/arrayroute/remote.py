@@ -3,16 +3,20 @@
 
 from __future__ import annotations
 
+import json
 import re
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from operator import index
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import urlsplit
 
 from .backends import TensorStoreBackend
 from .plan import Selection
 from .reader import ArrayReader, ReadStats
+
+if TYPE_CHECKING:
+    from .disk_cache import ArrayIdentity, TileCache
 
 
 def _url(value: str) -> str:
@@ -104,6 +108,11 @@ class RemoteReadSession:
     session's cached handles but cannot create a consistent snapshot of mutable objects.
     Native credential resolution occurs in each worker. Sessions are not thread-safe;
     serialized copies discard native handles/context and must be used with spawn.
+
+    Optional tile_cache is shared only on node-local disk. cache_identity must name
+    an immutable source revision and representation; paths and endpoint identity are
+    included automatically. clear() discards native handles, not persistent tiles.
+    The caller owns the cache lifecycle and must use an authorized cache directory.
     """
 
     def __init__(
@@ -115,9 +124,19 @@ class RemoteReadSession:
         cache_bytes: int = 0,
         concurrency: int = 8,
         max_retries: int = 3,
+        tile_cache: TileCache | None = None,
+        cache_identity: ArrayIdentity | None = None,
     ):
         if not isinstance(store, (HttpStore, S3Store)):
             raise TypeError("Provide an explicit HttpStore or S3Store")
+        if (tile_cache is None) != (cache_identity is None):
+            raise ValueError("Persistent caching requires both tile_cache and cache_identity")
+        if tile_cache is not None:
+            from .disk_cache import ArrayIdentity, TileCache
+
+            if (not isinstance(tile_cache, TileCache)
+                    or not isinstance(cache_identity, ArrayIdentity)):
+                raise TypeError("Provide a TileCache and an immutable ArrayIdentity")
         buffer_bytes, max_open_arrays, cache_bytes, concurrency, max_retries = (
             index(v) for v in (buffer_bytes, max_open_arrays, cache_bytes, concurrency, max_retries)
         )
@@ -131,6 +150,7 @@ class RemoteReadSession:
         self.cache_bytes = cache_bytes
         self.concurrency = concurrency
         self.max_retries = max_retries
+        self.tile_cache, self.cache_identity = tile_cache, cache_identity
         self._context: Any = None
         self._readers: OrderedDict[str, ArrayReader] = OrderedDict()
 
@@ -165,7 +185,15 @@ class RemoteReadSession:
             recheck_cached_data=False,
             context=self._context,
         ).result()
-        reader = ArrayReader(TensorStoreBackend(array), buffer_bytes=self.buffer_bytes)
+        backend = TensorStoreBackend(array)
+        if self.tile_cache is not None and self.cache_identity is not None:
+            identity = replace(self.cache_identity, source=json.dumps(
+                [self.cache_identity.source, self.store.spec(path)],
+                sort_keys=True, separators=(",", ":")))
+            reader = ArrayReader(self.tile_cache.backend(backend, identity),
+                                 buffer_bytes=self.buffer_bytes)
+        else:
+            reader = ArrayReader(backend, buffer_bytes=self.buffer_bytes)
         while len(self._readers) >= self.max_open_arrays:
             self._readers.popitem(last=False)
         self._readers[path] = reader

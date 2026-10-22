@@ -748,3 +748,63 @@ This benchmark includes missing values, repeated values, deep cursors, full inte
 verification and global quantiles. It retains fresh-process measurements, checks each
 result against an independent reference order, and does not claim numerical-array,
 network or browser throughput.
+
+## Shared, revision-specific tile caching
+
+Install `arrayroute[disk-cache,tensorstore]` to reuse decoded numeric tiles across
+workers and process restarts. This is optional: a native in-memory cache is generally
+cheaper when the working set fits and workers stay alive. Persistent cache population
+adds serialization and disk writes; use it for repeated remote reads, not a one-pass scan.
+
+```python
+from arrayroute.disk_cache import ArrayIdentity, TileCache
+from arrayroute.remote import HttpStore, RemoteReadSession
+
+cache = TileCache(
+    "/local-ssd/my-user/tiles",
+    capacity_bytes=8 << 30,
+    max_entry_bytes=32 << 20,
+)
+session = RemoteReadSession(
+    HttpStore("https://my-data.example/immutable-snapshot"),
+    tile_cache=cache,
+    cache_identity=ArrayIdentity(
+        source="simulation-dataset",
+        revision="immutable-manifest-revision",
+        representation="raw-velocity-metres-per-second-v1",
+    ),
+)
+try:
+    velocity = session.read("velocity", (0, slice(0, 64), slice(0, 64), slice(0, 64)))
+finally:
+    session.clear()
+    cache.close()
+```
+
+The revision must come from the actual immutable dataset, never a mutable path or
+a constant reused after edits. Representation changes must cover decoding, units and
+preprocessing semantics. Endpoint/array path, shape, chunk layout, dtype and normalized
+selection also enter the cache identity. Any `ArrayReader` backend can be wrapped with
+`cache.backend(backend, identity)`; this does not require TensorStore or cloud storage.
+
+Every hit is size-checked and SHA-256 verified against the key and retained content.
+The cache reads directly into a writable NumPy output, with no pickle deserialization.
+Caller mutations do not affect cached values. Damaged entries are removed and refetched;
+origin failures and database I/O errors propagate. Hashes detect accidental corruption,
+not malicious changes to both data and checksum. Cache identity is a caller assertion,
+not source authentication or a snapshot creator.
+
+DiskCache supplies cross-process coordination and LRU eviction. Use a dedicated **local
+filesystem** directory shared only by authorized workers of the same user/tenant;
+do not put this SQLite-backed cache on NFS. It is not a distributed cache or an access
+control boundary. Concurrent misses may fetch the same tile. All workers must agree
+on cache size policy. Serialized cache/session objects reopen in spawned workers.
+
+Capacity is DiskCache's approximate database-plus-payload volume after eviction.
+WAL, filesystem bookkeeping, concurrent writes and temporary files are additional;
+use a filesystem quota when a strict disk bound is needed. Entries larger than
+`max_entry_bytes` bypass caching. Cache hits allocate one output array; miss serialization
+can require two additional output-sized buffers beyond the reader's budget. Backend
+`stats` distinguish hits, misses, bypasses, corruptions, hit bytes and source bytes;
+these are tile counts/bytes, not compressed network-transfer measurements. Opening an
+array can still fetch its metadata even when all requested tiles are cached.
