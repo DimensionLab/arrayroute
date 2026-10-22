@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from collections import OrderedDict
 from operator import index
 from pathlib import Path
@@ -27,6 +28,8 @@ class LocalReadSession:
     With immutable=True, TensorStore skips data freshness checks and can reuse cached
     chunks directly. This is a caller assertion, not a snapshot or a write lock: values
     must remain unchanged too. clear() starts a fresh context after input changes.
+    Sessions created by TensorStoreReadGroup keep that group's context across clear();
+    create a new group after changing inputs. Group-owned sessions cannot be serialized.
 
     This adapter supports local or mounted filesystems. ArrayReader's Backend protocol
     remains the extension point for object stores and other storage systems.
@@ -64,16 +67,22 @@ class LocalReadSession:
         self.tensorstore_threads = tensorstore_threads
         self.immutable = immutable
         self._context: Any = None
+        self._group: TensorStoreReadGroup | None = None
         self._readers: OrderedDict[tuple[str, str], ArrayReader] = OrderedDict()
 
     def clear(self) -> None:
+        """Drop this session's handles; an explicit shared group's cache stays alive."""
         self._readers.clear()
         self._context = None
 
     def __getstate__(self) -> dict:
+        if self._group is not None:
+            raise TypeError("Shared read sessions are in-process only; create a group after spawn")
         return {**vars(self), "_readers": OrderedDict(), "_context": None}
 
     def open(self, store: str | Path, array_path: str) -> ArrayReader:
+        if self._group is not None:
+            self._group._check_process()
         key = (str(Path(store).absolute()), array_path.strip("/"))
         found = self._readers.get(key)
         if found is not None:
@@ -88,7 +97,7 @@ class LocalReadSession:
             import tensorstore as ts
 
             if self._context is None:
-                self._context = ts.Context(
+                self._context = self._group._context if self._group is not None else ts.Context(
                     {
                         "cache_pool": {"total_bytes_limit": self.tensorstore_cache_bytes},
                         "data_copy_concurrency": {"limit": self.tensorstore_threads},
@@ -127,3 +136,69 @@ class LocalReadSession:
         stats: ReadStats | None = None,
     ):
         return self.open(store, array_path).read(selection, stats=stats)
+
+
+class TensorStoreReadGroup:
+    """Share native cache and thread budgets across independent in-process sessions.
+
+    A group can create one session per worker thread. Python handle caches, readers,
+    output arrays and statistics remain worker-owned; only TensorStore's native
+    context is shared. ``cache_bytes`` is a soft limit for the whole group, not per
+    session, and excludes outputs, decoder scratch and Python metadata.
+
+    Metadata must stay fixed. ``immutable=True`` additionally asserts that values
+    stay fixed; this is not a storage snapshot. ``session.clear()`` drops local
+    handles but cannot invalidate shared cache entries. After changing source data,
+    release all old sessions and create a new group. Groups are deliberately not
+    serializable and must be constructed after spawning processes, never before fork.
+    """
+
+    def __init__(self, *, cache_bytes: int = 0, threads: int = 8, immutable: bool = False):
+        if isinstance(cache_bytes, bool) or isinstance(threads, bool):
+            raise TypeError("Cache bytes and thread count must be integers, not booleans")
+        cache_bytes, threads = index(cache_bytes), index(threads)
+        if cache_bytes < 0 or threads < 1:
+            raise ValueError("Cache bytes must be nonnegative and thread count positive")
+        if not isinstance(immutable, bool):
+            raise TypeError("immutable must be a boolean")
+        import tensorstore as ts
+
+        self._cache_bytes, self._threads, self._immutable = cache_bytes, threads, immutable
+        self._pid = os.getpid()
+        self._context = ts.Context({
+            "cache_pool": {"total_bytes_limit": cache_bytes},
+            "data_copy_concurrency": {"limit": threads},
+            "file_io_concurrency": {"limit": threads},
+        })
+
+    @property
+    def cache_bytes(self) -> int:
+        return self._cache_bytes
+
+    @property
+    def threads(self) -> int:
+        return self._threads
+
+    @property
+    def immutable(self) -> bool:
+        return self._immutable
+
+    def _check_process(self) -> None:
+        if os.getpid() != self._pid:
+            raise RuntimeError("Shared read groups must be constructed in the consuming process")
+
+    def __getstate__(self) -> dict:
+        raise TypeError("Shared read groups are in-process only; create a group after spawn")
+
+    def session(
+        self, *, buffer_bytes: int = 128 << 20, max_open_arrays: int = 64,
+    ) -> LocalReadSession:
+        """Create a worker-owned session using this group's aggregate native budget."""
+        self._check_process()
+        session = LocalReadSession(
+            "tensorstore", buffer_bytes=buffer_bytes, max_open_arrays=max_open_arrays,
+            tensorstore_cache_bytes=self.cache_bytes, tensorstore_threads=self.threads,
+            immutable=self.immutable,
+        )
+        session._group = self
+        return session

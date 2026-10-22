@@ -135,6 +135,38 @@ snapshot sessions when a concurrent writer must be supported. The native cache s
 **soft** eviction limit, not a hard process-memory bound. See TensorStore's
 [cache and freshness options](https://google.github.io/tensorstore/python/api/tensorstore.TensorStore.spec.html).
 
+### Share native resources across reader threads
+
+`TensorStoreReadGroup` gives independent worker sessions one native cache and I/O/copy
+thread budget. Create the group once, then create a session inside each worker:
+
+```python
+from arrayroute.execution import OrderedPool
+from arrayroute.session import TensorStoreReadGroup
+
+group = TensorStoreReadGroup(cache_bytes=128 << 20, threads=8, immutable=True)
+
+def make_reader():
+    session = group.session(buffer_bytes=64 << 20, max_open_arrays=16)
+    return lambda selection: session.read("/data/case.zarr", "fields/velocity", selection)
+
+with OrderedPool(make_reader, workers=8, max_pending=8) as pool:
+    with pool.map(selections) as values:
+        for value in values:
+            consume(value)
+```
+
+The 128 MiB native cache soft limit applies to the whole group. Each worker still owns
+its handle cache and output buffers; retained results, decoder scratch and Python
+metadata are additional memory. This uses TensorStore's documented
+[shared resource context](https://google.github.io/tensorstore/context.html).
+It does not share mutable Python session state or promise a speedup for every workload.
+
+Create groups after spawning a process. Groups and their sessions reject serialization
+and cross-process reuse. Clearing one session drops its handles while preserving the
+group's native cache. To refresh changed inputs, release all old sessions and construct
+a new group; `immutable=True` remains a caller assertion, not snapshot isolation.
+
 ## Read remote arrays
 
 Install the optional `tensorstore` extra to read immutable Zarr v3 arrays over HTTP or
