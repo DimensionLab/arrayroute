@@ -114,6 +114,22 @@ class ZarristaBackend:
         selectors = tuple(slice(s, s + 1) if isinstance(s, int) else s for s in selection)
         return np.squeeze(np.asarray(self.array[selectors]), axis=axes)
 
+    def read_shard_region(self, selection: Selection) -> np.ndarray:
+        """Gather a single normalized region from a full shard, under an admitted plan."""
+        shape = tuple(self.array.chunk_shape([0] * self.array.ndim))
+        starts = [s if isinstance(s, int) else s.start for s in selection]
+        coordinates = [s // r for s, r in zip(starts, shape, strict=True)]
+        for s, r in zip(selection, shape, strict=True):
+            if isinstance(s, slice) and (s.stop <= s.start or s.start // r != (s.stop - 1) // r):
+                raise ValueError("Bulk selection must stay within one shard")
+        dense = np.asarray(self.array.retrieve_chunk(coordinates, concurrent_target=1))
+        local = tuple(
+            s % r if isinstance(s, int) else
+            slice(s.start % r, s.start % r + s.stop - s.start, s.step)
+            for s, r in zip(selection, shape, strict=True)
+        )
+        return dense[local].copy(order="C")
+
     def _strided(self, selection: Selection) -> np.ndarray:
         request = plan(self.spec, selection)
         result = np.empty(request.output_shape, dtype=self.dtype)

@@ -36,12 +36,15 @@ class DecodeWindow:
 
 @dataclass(frozen=True)
 class GatherWindow:
-    """Independent grid regions with one live decoded chunk per worker."""
+    """Independent regions with single-chunk partial or two-region bulk decoding."""
 
     region_shape: tuple[int, ...]
     workers: int
+    bulk: bool = False
 
     def __post_init__(self) -> None:
+        if not isinstance(self.bulk, bool):
+            raise TypeError("bulk must be a boolean")
         if (isinstance(self.workers, bool) or not isinstance(self.workers, int)
                 or not 1 <= self.workers <= 256):
             raise ValueError("Gather workers must be an integer from 1 to 256")
@@ -95,7 +98,7 @@ class ReadPlan:
     decoded_bytes_upper_bound: int
     peak_decoded_bytes_upper_bound: int
     intermediate_bytes_upper_bound: int = 0
-    strategy: Literal["native", "dense-gather", "parallel-gather"] = "native"
+    strategy: Literal["native", "dense-gather", "parallel-gather", "bulk-gather"] = "native"
     read_selection: Selection | None = None
     gather_workers: int = 1
 
@@ -170,6 +173,10 @@ def plan(spec: ArraySpec, selection: Selection, *, buffer_bytes: int | None = No
             for s, r in zip(request.selection, gather.region_shape, strict=True)
             if isinstance(s, slice)
         )
+        if gather.bulk:
+            bulk = _bulk_plan(spec, request, regions, region_output, buffer_bytes)
+            if bulk is not None:
+                return bulk
         for workers in range(min(gather.workers, regions), 1, -1):
             candidate = replace(
                 request, strategy="parallel-gather", gather_workers=workers,
@@ -197,6 +204,34 @@ def plan(spec: ArraySpec, selection: Selection, *, buffer_bytes: int | None = No
             and candidate.buffer_bytes_upper_bound <= buffer_bytes):
         return candidate
     return request
+
+
+def _bulk_plan(
+    spec: ArraySpec, request: ReadPlan, regions: int, region_output: int, buffer_bytes: int,
+) -> ReadPlan | None:
+    gather = spec.gather_window
+    assert gather is not None
+    bounds = []
+    for s, r, size in zip(request.selection, gather.region_shape, spec.shape, strict=True):
+        start = s if isinstance(s, int) else s.start
+        last = s if isinstance(s, int) else s.start + (_length(s) - 1) * s.step
+        bounds.append(slice(start // r * r, min(size, (last // r + 1) * r)))
+    expanded = plan(replace(spec, gather_window=None), tuple(bounds))
+    # Bulk reads must not decode skipped in-domain chunks. Padded boundary chunks
+    # still count toward the physical decode bound below.
+    if expanded.chunks_touched != request.chunks_touched:
+        return None
+    region_bytes = math.prod(gather.region_shape) * spec.itemsize
+    for workers in range(min(gather.workers, regions), 0, -1):
+        candidate = replace(
+            request, strategy="bulk-gather", gather_workers=workers,
+            decoded_bytes_upper_bound=regions * region_bytes,
+            peak_decoded_bytes_upper_bound=2 * workers * region_bytes,
+            intermediate_bytes_upper_bound=min(request.output_bytes, workers * region_output),
+        )
+        if candidate.buffer_bytes_upper_bound <= buffer_bytes:
+            return candidate
+    return None
 
 
 @dataclass(frozen=True)

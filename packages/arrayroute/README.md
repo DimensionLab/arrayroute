@@ -1163,3 +1163,32 @@ not a measurement of active threads; a cache hit may launch none.
 `probe_reads` includes these in every trial, so the requested maximum can be
 compared with actual budget-reduced counts. Native reads report one gather worker;
 that does not count the engine's own internal threads.
+
+### Bulk shard reads
+
+For previews that touch every inner chunk of small shards, try
+`read_strategy="bulk"` with the same `gather_workers` setting. It decodes an entire
+shard per task through Zarrista's native `retrieve_chunk` operation and gathers the
+selected values into a compact array. This can avoid thousands of small native
+calls and byte-range requests. It is opt-in: large shards can be slower and require
+substantially more memory than partial decoding. Benchmark it against `parallel`
+and TensorStore on the intended selections and buffer limits.
+
+The planner admits bulk reads only when they add no skipped in-domain chunks. It
+charges the final output, compact pending results, and two full decoded shard
+buffers per worker, including edge padding. It lowers the worker count as needed;
+if no bulk worker fits or the selection skips chunks, it plans partial parallel
+gathering or a native read using the existing buffer rules. Contiguous reads remain
+native. `bulk-gather` identifies actual bulk execution in plans and statistics.
+The allowance excludes compressed inputs, indexes, codec scratch and other native
+state; observed process memory can exceed it. Per-shard codec concurrency is one,
+while the outer executor runs the admitted shard tasks concurrently.
+
+Generic adapters can opt in with `GatherWindow(..., bulk=True)` and
+`ParallelGatherBackend(..., bulk_factory=...)`. Each factory returns a worker-local
+callable accepting one normalized region and returning its compact selected values.
+It must preserve dtype/shape, release all decoder state between calls, obey the
+two-region decoded-buffer bound and never reserve from the parent reader's budget.
+The ordinary factory still supplies the single-chunk partial reader. All workers
+are joined before returning or raising; bulk reads retain the same cache and
+streaming contracts as partial reads.

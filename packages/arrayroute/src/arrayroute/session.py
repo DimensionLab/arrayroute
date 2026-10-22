@@ -60,15 +60,15 @@ class LocalReadSession:
         )
         if engine not in {"zarr-python", "tensorstore", "zarrista"}:
             raise ValueError(f"Unknown array engine {engine!r}")
-        if read_strategy not in {"native", "dense", "parallel"}:
-            raise ValueError("read_strategy must be native, dense or parallel")
+        if read_strategy not in {"native", "dense", "parallel", "bulk"}:
+            raise ValueError("read_strategy must be native, dense, parallel or bulk")
         if (isinstance(gather_workers, bool) or not isinstance(gather_workers, int)
                 or not 1 <= gather_workers <= 256):
             raise ValueError("Gather workers must be an integer from 1 to 256")
-        if read_strategy == "parallel" and engine != "zarrista":
+        if read_strategy in {"parallel", "bulk"} and engine != "zarrista":
             raise ValueError("Parallel gathering currently requires the Zarrista engine")
-        if read_strategy != "parallel" and gather_workers != 4:
-            raise ValueError("gather_workers requires the parallel read strategy")
+        if read_strategy not in {"parallel", "bulk"} and gather_workers != 4:
+            raise ValueError("gather_workers requires the parallel or bulk read strategy")
         self.gather_workers = gather_workers
         self.read_strategy = read_strategy
         if (
@@ -154,12 +154,15 @@ class LocalReadSession:
             array = zarrista.Array.open(zarrista.store.FilesystemStore(key[0]), path="/" + key[1])
             native = ZarristaBackend(array)
             backend = native
-            if self.read_strategy == "parallel":
+            if self.read_strategy in {"parallel", "bulk"}:
                 if not native._partial_shards:
                     raise ValueError("Parallel gathering requires independently decodable shards")
                 backend = ParallelGatherBackend(
                     native, lambda: ZarristaBackend(array),
-                    GatherWindow(tuple(array.chunk_shape([0] * array.ndim)), self.gather_workers),
+                    GatherWindow(tuple(array.chunk_shape([0] * array.ndim)), self.gather_workers,
+                                 bulk=self.read_strategy == "bulk"),
+                    bulk_factory=(lambda: ZarristaBackend(array).read_shard_region)
+                    if self.read_strategy == "bulk" else None,
                 )
         if self.read_strategy == "dense":
             backend = DenseGatherBackend(backend)
