@@ -114,6 +114,46 @@ def test_factory_must_honor_memory_and_identity():
     assert not calls
 
 
+def test_insufficient_per_worker_buffers_are_skipped():
+    factory, selections, options, calls = setup()
+    options['total_buffer_bytes'] = 128
+    result = probe_reads(factory, selections, **options)
+    assert result['fastest_observed_workers'] == 1
+    assert [item['workers'] for item in result['skipped']] == [2, 4]
+    assert len(calls) == 12
+
+
+def test_hashing_noncontiguous_output_uses_bounded_scratch(monkeypatch):
+    import arrayroute.probe as module
+
+    original = module.hashlib.sha256
+    sizes = []
+
+    class Digest:
+        def __init__(self):
+            self.inner = original()
+
+        def update(self, block):
+            sizes.append(len(block))
+            self.inner.update(block)
+
+        def hexdigest(self):
+            return self.inner.hexdigest()
+
+    monkeypatch.setattr(module.hashlib, 'sha256', Digest)
+    values = np.arange(262144, dtype=np.float32).reshape(1, -1)[:, ::2]
+
+    def factory(budget):
+        return ArrayReader(Backend(values, []), buffer_bytes=budget)
+
+    result = probe_reads(factory, [(0, slice(None))], worker_counts=[1],
+                         total_buffer_bytes=2 << 20, max_output_bytes=2 << 20,
+                         time_budget_seconds=30, repeats=1)
+    assert result['state'] == 'completed'
+    assert result['reference_sha256'] == [original(values[0].tobytes()).hexdigest()]
+    assert max(sizes) <= 32768 and sum(sizes) == values.nbytes * 2
+
+
 @pytest.mark.parametrize('key,value', [
     ('repeats', 0), ('repeats', 101), ('total_buffer_bytes', True),
     ('max_output_bytes', -1), ('worker_counts', []), ('worker_counts', [1, 1]),
