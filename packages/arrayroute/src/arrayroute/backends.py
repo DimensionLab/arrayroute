@@ -40,7 +40,9 @@ class ZarristaBackend:
         self.dtype = np.dtype(array.metadata["data_type"])
         chunks = array.effective_subchunk_shape or array.chunk_shape([0] * array.ndim)
         codecs = array.metadata["codecs"]
-        if any(c["name"] == "sharding_indexed" for c in codecs[:-1]):
+        outer_codec = any(c["name"] == "sharding_indexed" for c in codecs[:-1])
+        self._partial_shards = array.is_sharded and not outer_codec
+        if outer_codec:
             # A codec outside the shard requires decoding the complete shard.
             chunks = array.chunk_shape([0] * array.ndim)
         self.spec = ArraySpec(tuple(array.shape), tuple(chunks), self.dtype.itemsize)
@@ -59,10 +61,32 @@ class ZarristaBackend:
     def _strided(self, selection: Selection) -> np.ndarray:
         request = plan(self.spec, selection)
         result = np.empty(request.output_shape, dtype=self.dtype)
+        cache = self.array.shard_cache() if self._partial_shards else None
+        shard_shape = self.array.chunk_shape([0] * self.array.ndim) if cache is not None else ()
+        active_shard = None
 
         def visit(axis, sources, targets, strides):
+            nonlocal active_shard
             if axis == len(selection):
-                result[tuple(targets)] = self._contiguous(tuple(sources))[tuple(strides)]
+                if cache is None:
+                    value = self._contiguous(tuple(sources))
+                else:
+                    starts = [s if isinstance(s, int) else s.start for s in sources]
+                    shard = tuple(p // c for p, c in zip(starts, shard_shape, strict=True))
+                    if shard != active_shard:
+                        # Retain at most one index, and never reuse it across read calls.
+                        cache.clear()
+                        active_shard = shard
+                    chunks = self.spec.chunks
+                    coordinates = [p // c for p, c in zip(starts, chunks, strict=True)]
+                    local = tuple(
+                        s % c if isinstance(s, int)
+                        else slice(s.start % c, s.start % c + s.stop - s.start)
+                        for s, c in zip(sources, chunks, strict=True)
+                    )
+                    value = np.asarray(self.array.retrieve_subchunk(
+                        coordinates, shard_cache=cache))[local]
+                result[tuple(targets)] = value[tuple(strides)]
                 return
             sel, chunk = request.selection[axis], self.spec.chunks[axis]
             if isinstance(sel, int):

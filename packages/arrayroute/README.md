@@ -43,6 +43,14 @@ lossy conversion is performed. Decoded-byte estimates assume full inner-chunk de
 partial codecs can do better. Transport bytes must be measured by the backend, not inferred
 from those estimates. A large logical shape is not evidence of large physical I/O throughput.
 
+Zarrista strided reads gather only touched inner chunks. When partial shard decoding is
+available, the adapter reuses one shard index while gathering those chunks and discards
+it before moving to another shard or returning from the read. Index bytes and native
+bookkeeping are additional to the read-buffer allowance; no field payload is cached by
+this mechanism. Reads after a completed external write create fresh indexes. Concurrent
+source mutation still requires snapshot isolation supplied by the caller. An outer
+shard codec uses whole-shard accounting and the ordinary subset reader.
+
 `arrayroute.statistics.ChannelMoments` accumulates or merges channel-last population
 statistics from bounded buffers, with optional per-channel validity masks. It keeps integer
 counts and centred float64 moments; missing observations do not contaminate the result.
