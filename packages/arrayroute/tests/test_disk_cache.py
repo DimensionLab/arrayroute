@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 import hashlib
-import multiprocessing
+import json
+import os
 import pickle
 import sqlite3
-from concurrent.futures import ProcessPoolExecutor
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pytest
@@ -148,20 +151,27 @@ def _process_read(args):
     for _ in range(20):
         value = backend.read((slice(None), slice(None)))
         hashes.append(hashlib.sha256(value.tobytes()).hexdigest())
-    result = (hashes, backend.stats.hits, backend.stats.misses)
+    result = (hashes, backend.stats.hits, backend.stats.misses, os.getpid())
     cache.close()
     return result
 
 
-def test_spawned_workers_share_cache_and_reopen_on_restart(tmp_path):
-    ctx = multiprocessing.get_context("spawn")
-    with ProcessPoolExecutor(4, mp_context=ctx) as pool:
-        cold = list(pool.map(_process_read, [(str(tmp_path), True)] * 4))
-    with ProcessPoolExecutor(4, mp_context=ctx) as pool:
-        warm = list(pool.map(_process_read, [(str(tmp_path), False)] * 4))
+def _subprocess_read(args):
+    result = subprocess.run([sys.executable, __file__, "--cache-worker", json.dumps(args)],
+                            capture_output=True, text=True, check=True, timeout=30)
+    return json.loads(result.stdout)
+
+
+def test_independent_workers_share_cache_and_reopen_on_restart(tmp_path):
+    # File entry points work under pytest importlib mode in a standalone export too.
+    with ThreadPoolExecutor(4) as pool:
+        cold = list(pool.map(_subprocess_read, [(str(tmp_path), True)] * 4))
+    with ThreadPoolExecutor(4) as pool:
+        warm = list(pool.map(_subprocess_read, [(str(tmp_path), False)] * 4))
     expected = hashlib.sha256(np.arange(4096, dtype=np.float32).tobytes()).hexdigest()
-    assert all(set(hashes) == {expected} for hashes, _, _ in cold + warm)
-    assert all(hits == 20 and misses == 0 for _, hits, misses in warm)
+    assert all(set(hashes) == {expected} for hashes, _, _, _ in cold + warm)
+    assert all(hits == 20 and misses == 0 for _, hits, misses, _ in warm)
+    assert len({pid for _, _, _, pid in cold + warm}) == 8
     cache = open_cache(tmp_path)
     assert cache._cache.check() == []
     cache.close()
@@ -199,3 +209,8 @@ def test_cache_metadata_cannot_delete_an_external_file(tmp_path):
         backend.read((slice(None),))
     assert external.read_bytes() == b"keep this file"
     cache.close()
+
+
+if __name__ == "__main__":
+    assert sys.argv[1] == "--cache-worker"
+    print(json.dumps(_process_read(json.loads(sys.argv[2]))))
