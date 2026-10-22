@@ -821,3 +821,36 @@ array can still fetch its metadata even when all requested tiles are cached.
 `coalesced_hits` counts hits found after entering the fill lock, and
 `fill_wait_seconds` measures successful fill-lock acquisition time. Keep one backend
 per worker; do not wrap a cached backend in another cache.
+
+## Reuse workers across passes
+
+`OrderedPool` keeps each worker callable on its owning thread between passes. This
+lets a preprocessing or training adapter retain immutable array handles and bounded
+native caches without constructing them again for every epoch:
+
+```python
+from arrayroute.execution import OrderedPool
+
+with OrderedPool(make_processor, workers=4, max_pending=4) as pool:
+    for selections in epoch_selections:
+        with pool.map(selections) as results:
+            for result in results:
+                consume(result)
+```
+
+`make_processor()` is called once on each active thread and returns a callable that
+processes one selection. The factory must create independent reader state, and each
+request must carry any epoch-specific selection or transform parameters. A pool permits
+only one map context at a time, even before consumption begins. Exiting that context
+cancels queued work and waits for already-running calls before another pass can begin.
+Task errors surface at their input position without retrying or dropping samples.
+
+The pool retains at most `max_pending` tasks/results, including the result currently
+yielded to the caller. Native caches, decoder scratch and caller-retained results are
+additional; this is not a process-memory cap. The input iterable remains caller-owned.
+Use `pool.map(..., cancelled=...)` for cooperative cancellation between calls and close
+the pool (preferably with `with`) to join all worker threads. A blocking native call
+cannot be forcibly cancelled by this API; hard deadlines require process isolation.
+
+The existing `ordered_map` convenience function uses a fresh pool for one pass and
+releases it on exit. Neither API depends on a machine-learning framework or cloud.
