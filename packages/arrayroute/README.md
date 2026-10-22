@@ -917,3 +917,36 @@ cannot be forcibly cancelled by this API; hard deadlines require process isolati
 
 The existing `ordered_map` convenience function uses a fresh pool for one pass and
 releases it on exit. Neither API depends on a machine-learning framework or cloud.
+
+## Measure reader concurrency on your own data
+
+`arrayroute.probe.probe_reads` runs bounded pilots through any `ArrayReader` factory:
+
+```python
+from arrayroute.probe import probe_reads
+from arrayroute.session import LocalReadSession
+
+def make_reader(budget):
+    session = LocalReadSession("tensorstore", buffer_bytes=budget, tensorstore_threads=1)
+    return session.open("simulation.zarr", "velocity")
+
+result = probe_reads(
+    make_reader,
+    [(t, slice(0, 64), slice(0, 64), slice(0, 64), slice(None)) for t in range(8)],
+    worker_counts=[1, 2, 4], total_buffer_bytes=256 << 20,
+    max_output_bytes=1024 << 20, time_budget_seconds=60,
+)
+```
+
+The factory must create independent, read-only worker state over unchanged values and
+honor its assigned buffer size. A sequential reference pass precedes shuffled repetitions;
+all results must match its hashes. Read caps include every pass and are checked before
+payload I/O. Timed trials include opening readers, reads, SHA-256 and worker teardown.
+Repeated regions may be warm in OS/remote caches: the result ranks only this pilot, not
+raw storage bandwidth or training speed. No machine settings change automatically.
+
+The deadline is cooperative between reads. Active native calls are joined; use process
+isolation for a hard deadline. Partial pilots never recommend a worker count. Native
+caches, codec scratch and up to 64 KiB hash scratch per active worker are additional to
+the read-buffer allowance. Source bytes are never written. The reference checks read
+consistency; it does not establish scientific ground truth or a storage snapshot.
