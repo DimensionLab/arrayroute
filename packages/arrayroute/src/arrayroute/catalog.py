@@ -75,6 +75,22 @@ class CatalogPage:
     encoded_bytes: int
 
 
+def _publish_snapshot(temporary: Path, target: Path, count: int, identity: str) -> CatalogReceipt:
+    with temporary.open("rb") as stream:
+        os.fsync(stream.fileno())
+        file_hash = hashlib.file_digest(stream, "sha256").hexdigest()
+    size = temporary.stat().st_size
+    os.link(temporary, target)
+    # Persist the publication as well as the SQLite contents on POSIX filesystems.
+    if os.name == "posix":
+        directory = os.open(target.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    return CatalogReceipt(target, count, identity, size, file_hash)
+
+
 def write_catalog(
     path: str | Path,
     records: Iterable[tuple[str, Any]],
@@ -122,19 +138,7 @@ def write_catalog(
         connection.commit()
         connection.close()
         connection = None
-        with temporary.open("rb") as stream:
-            os.fsync(stream.fileno())
-            file_hash = hashlib.file_digest(stream, "sha256").hexdigest()
-        size = temporary.stat().st_size
-        os.link(temporary, target)
-        # Persist the publication as well as the SQLite contents on POSIX filesystems.
-        if os.name == "posix":
-            directory = os.open(target.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
-        return CatalogReceipt(target, count, identity, size, file_hash)
+        return _publish_snapshot(temporary, target, count, identity)
     finally:
         if connection is not None:
             connection.close()

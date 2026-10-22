@@ -587,3 +587,64 @@ python -m arrayroute.benchmark_catalog --out /tmp/catalog-million --records 1000
 ```
 
 It measures local metadata access, not numerical throughput or petabyte storage performance.
+
+## Global scalar ordering and quantiles
+
+`arrayroute.numeric_catalog` publishes an immutable index for one scalar column.
+Use it to select the highest/lowest values or inspect distribution groups across
+the whole dataset without loading every metadata record. Ordinals refer to records
+in the source snapshot; its revision is required when opening the index.
+
+```python
+from arrayroute.numeric_catalog import NumericIndex, write_numeric_index
+
+receipt = write_numeric_index(
+    "inlet-velocity.sqlite",
+    (case.get("inlet_velocity") for case in cases_in_source_order),
+    source_revision=catalog_revision,
+    field="inlet_velocity",
+    units="m/s",
+)
+with NumericIndex(receipt.path, source_revision=catalog_revision,
+                  expected_revision=receipt.revision) as index:
+    fastest = index.page(descending=True, limit=64)
+    global_quartile_edges = index.quantiles(4)
+    if fastest.next_cursor is not None:
+        following = index.page(descending=True, cursor=fastest.next_cursor, limit=64)
+```
+
+Equal values retain source order in both directions. `None` sorts last; quantiles
+exclude missing values. Signed zeros compare equally. Accepted values are finite
+Python floats, exact integers between `-2**53` and `2**53`, or `None`; booleans,
+non-finite values, and larger integers are rejected. Global quantile edges use
+inclusive ceil-based ranks, and equal values belong to the same group. Group an
+observed value using the first upper edge greater than or equal to it; missing
+values belong in a separate group. Do not recalculate edges from a visible page.
+
+Pages return at most 4,096 ordinal/value pairs and use composite-index continuation,
+including for descending order and missing values. Cursors belong to a specific
+index revision and sort direction. Quantiles support 1–64 bins and are cached per
+reader after their first computation. First-time quantiles traverse index positions;
+their cost is distinct from the constant-size page lookup.
+
+Publication consumes the values once and uses the same commit, file sync, and
+non-overwriting hard-link protocol as the JSON catalog. Readers validate the schema,
+pin a read transaction, and check returned row hashes. `verify()` performs a full
+logical integrity scan; the receipt also includes the entire file's SHA-256. Header
+revision checks alone do not validate unread data. Hashes detect accidental damage,
+not malicious rewriting: authenticate receipts separately. Publish new files instead
+of changing an existing index, and use one reader per thread/process.
+
+The default SQLite cache is 8 MiB; interpreter overhead, decoded values and the OS
+cache are additional memory. This is a local scalar-index component, not a distributed
+catalog or a complete sample browser. Build indexes only for columns that need these
+queries, since each index has its own storage and publication cost.
+
+```sh
+python -m arrayroute.benchmark_numeric_catalog --out /tmp/numeric-million --records 1000000 --repeats 5
+```
+
+This benchmark includes missing values, repeated values, deep cursors, full integrity
+verification and global quantiles. It retains fresh-process measurements, checks each
+result against an independent reference order, and does not claim numerical-array,
+network or browser throughput.
