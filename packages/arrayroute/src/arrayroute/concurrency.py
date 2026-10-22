@@ -16,6 +16,7 @@ class ReadConcurrency:
     materialization: Literal["empty", "direct", "tiled", "stream-required", "chunk-too-large"]
     requests_per_value_lower_bound: int
     request_count_exact: bool
+    strategy: str = "native"
 
 
 @dataclass(frozen=True)
@@ -27,7 +28,7 @@ class ConcurrencyPlan:
     max_workers_without_tiling: int
     candidates: tuple[ReadConcurrency, ...]
     scope: str = (
-        "Output plus peak live decoded chunks for one value per reader; excludes "
+        "Output, intermediates and peak live decoded chunks for one value per reader; excludes "
         "queued batches, caller-retained outputs, native caches, transport and codec scratch. "
         "Candidates are memory plans, not throughput predictions."
     )
@@ -69,11 +70,12 @@ def plan_concurrency(
     candidates = []
     for workers in sorted(counts):
         budget = total_buffer_bytes // workers
+        cost = plan(spec, selection, buffer_bytes=budget)
         requests, exact = 0, True
         mode: Literal["empty", "direct", "tiled", "stream-required", "chunk-too-large"]
         if request.output_bytes == 0:
             mode = "empty"
-        elif request.buffer_bytes_upper_bound <= budget:
+        elif cost.buffer_bytes_upper_bound <= budget:
             mode, requests = "direct", 1
         elif request.output_bytes >= budget:
             mode = "stream-required"
@@ -87,7 +89,10 @@ def plan_concurrency(
                         break
             except MemoryError:
                 mode, requests, exact = "chunk-too-large", 0, True
-        candidates.append(ReadConcurrency(workers, budget, mode, requests, exact))
+        candidates.append(ReadConcurrency(
+            workers, budget, mode, requests, exact,
+            cost.strategy if mode in {"direct", "empty"} else "per-tile",
+        ))
     return ConcurrencyPlan(
         total_buffer_bytes, max_workers, request.output_bytes,
         request.buffer_bytes_upper_bound, untiled, tuple(candidates),

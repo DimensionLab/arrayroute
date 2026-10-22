@@ -4,11 +4,38 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from typing import Any
+from dataclasses import replace
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from .plan import ArraySpec, DecodeWindow, Selection, plan
+from .plan import ArraySpec, DecodeWindow, ReadPlan, Selection, plan
+
+if TYPE_CHECKING:
+    from .reader import Backend
+
+
+class DenseGatherBackend:
+    """Opt into native bounding-box reads when the plan permits their live buffers."""
+
+    def __init__(self, backend: Backend):
+        self.backend = backend
+        self.dtype = backend.dtype
+        self.spec = replace(backend.spec, dense_gather=True)
+
+    def read(self, selection: Selection) -> np.ndarray:
+        # Unplanned calls cannot authorize an additional intermediate allocation.
+        return self.backend.read(selection)
+
+    def read_plan(self, request: ReadPlan) -> np.ndarray:
+        if request.strategy == "native":
+            return self.backend.read(request.selection)
+        if request.strategy != "dense-gather" or request.read_selection is None:
+            raise ValueError("Dense gather requires its planned bounding selection")
+        dense = self.backend.read(request.read_selection)
+        gather = tuple(slice(None, None, s.step) for s in request.selection if isinstance(s, slice))
+        # A view would retain the full bounding array beyond the read reservation.
+        return dense[gather].copy(order="C")
 
 
 def _grid_regions(

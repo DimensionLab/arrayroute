@@ -13,7 +13,7 @@ from operator import index
 class ReadBudget:
     """Share a planned-buffer allowance across independent reader threads.
 
-    This accounts for ArrayReader's output-plus-decoded-chunk estimate, not RSS.
+    Accounts for planned output, intermediates and live decoded chunks, not RSS.
     Encoded transport, native caches, codec scratch and caller-retained outputs are
     additional. FIFO admission avoids indefinitely bypassing a larger queued read.
     Construct one pool per process after spawn. Nested reservations in one thread

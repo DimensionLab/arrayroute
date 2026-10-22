@@ -102,8 +102,9 @@ def probe_reads(
         'repeats': repeats, 'trials': [], 'fastest_observed_workers': None,
         'scope': 'Verified repeated-region wall time, including setup and SHA-256; '
                  'OS/remote caches uncontrolled; not raw I/O or training throughput',
-        'memory_scope': 'Per-worker output plus decoded-chunk estimate; excludes native caches, '
-                        'codec scratch and up to 64 KiB hash scratch per worker',
+        'memory_scope': 'Per-worker output, intermediates and decoded-chunk estimate; '
+                        'excludes native caches, codec scratch and up to 64 KiB hash scratch '
+                        'per worker',
         'deadline_scope': 'Cooperative between reads; in-flight native reads are joined',
     }
 

@@ -9,7 +9,7 @@ from operator import index
 from pathlib import Path
 from typing import Any
 
-from .backends import TensorStoreBackend, ZarrBackend, ZarristaBackend
+from .backends import DenseGatherBackend, TensorStoreBackend, ZarrBackend, ZarristaBackend
 from .budget import ReadBudget
 from .plan import Selection
 from .ranges import RangePolicy
@@ -48,6 +48,7 @@ class LocalReadSession:
         immutable: bool = False,
         range_policy: RangePolicy | None = None,
         read_budget: ReadBudget | None = None,
+        read_strategy: str = "native",
     ):
         if not isinstance(immutable, bool):
             raise TypeError("immutable must be a boolean")
@@ -57,6 +58,9 @@ class LocalReadSession:
         )
         if engine not in {"zarr-python", "tensorstore", "zarrista"}:
             raise ValueError(f"Unknown array engine {engine!r}")
+        if read_strategy not in {"native", "dense"}:
+            raise ValueError("read_strategy must be native or dense")
+        self.read_strategy = read_strategy
         if (
             min(buffer_bytes, max_open_arrays, tensorstore_threads) < 1
             or tensorstore_cache_bytes < 0
@@ -140,6 +144,8 @@ class LocalReadSession:
             backend = ZarristaBackend(
                 zarrista.Array.open(zarrista.store.FilesystemStore(key[0]), path="/" + key[1])
             )
+        if self.read_strategy == "dense":
+            backend = DenseGatherBackend(backend)
         reader = ArrayReader(
             backend, buffer_bytes=self.buffer_bytes, shared_budget=self.read_budget)
         while len(self._readers) >= self.max_open_arrays:
@@ -213,13 +219,14 @@ class TensorStoreReadGroup:
     def session(
         self, *, buffer_bytes: int = 128 << 20, max_open_arrays: int = 64,
         read_budget: ReadBudget | None = None,
+        read_strategy: str = "native",
     ) -> LocalReadSession:
         """Create a worker-owned session using this group's aggregate native budget."""
         self._check_process()
         session = LocalReadSession(
             "tensorstore", buffer_bytes=buffer_bytes, max_open_arrays=max_open_arrays,
             tensorstore_cache_bytes=self.cache_bytes, tensorstore_threads=self.threads,
-            immutable=self.immutable, read_budget=read_budget,
+            immutable=self.immutable, read_budget=read_budget, read_strategy=read_strategy,
         )
         session._group = self
         return session

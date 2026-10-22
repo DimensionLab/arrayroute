@@ -6,7 +6,8 @@ from __future__ import annotations
 import math
 import operator
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from typing import Literal
 
 Selection = tuple[int | slice, ...]
 
@@ -39,8 +40,11 @@ class ArraySpec:
     chunks: tuple[int, ...]
     itemsize: int
     decode_window: DecodeWindow | None = None
+    dense_gather: bool = False
 
     def __post_init__(self) -> None:
+        if not isinstance(self.dense_gather, bool):
+            raise TypeError("dense_gather must be a boolean")
         if self.decode_window is not None and not isinstance(self.decode_window, DecodeWindow):
             raise TypeError("decode_window must be a DecodeWindow or None")
         if not self.shape or len(self.shape) != len(self.chunks):
@@ -62,6 +66,9 @@ class ReadPlan:
     chunks_touched: int
     decoded_bytes_upper_bound: int
     peak_decoded_bytes_upper_bound: int
+    intermediate_bytes_upper_bound: int = 0
+    strategy: Literal["native", "dense-gather"] = "native"
+    read_selection: Selection | None = None
 
     @property
     def decode_amplification(self) -> float:
@@ -70,14 +77,19 @@ class ReadPlan:
     @property
     def buffer_bytes_upper_bound(self) -> int:
         # Encoded transport buffers and backend caches are separate from this budget.
-        return self.output_bytes + self.peak_decoded_bytes_upper_bound
+        return (self.output_bytes + self.peak_decoded_bytes_upper_bound
+                + self.intermediate_bytes_upper_bound)
 
 
 def _length(s: slice) -> int:
     return max(0, (s.stop - s.start + s.step - 1) // s.step)
 
 
-def plan(spec: ArraySpec, selection: Selection) -> ReadPlan:
+def plan(spec: ArraySpec, selection: Selection, *, buffer_bytes: int | None = None) -> ReadPlan:
+    if buffer_bytes is not None and (
+        isinstance(buffer_bytes, bool) or not isinstance(buffer_bytes, int) or buffer_bytes < 1
+    ):
+        raise ValueError("buffer_bytes must be a positive integer or None")
     if len(selection) != len(spec.shape):
         raise ValueError("Specify one integer or slice for every array dimension")
     normalized: list[int | slice] = []
@@ -109,7 +121,7 @@ def plan(spec: ArraySpec, selection: Selection) -> ReadPlan:
         not window.strided_only or any(isinstance(s, slice) and s.step > 1 for s in normalized)
     ):
         live_chunks = min(touched, window.max_chunks)
-    return ReadPlan(
+    request = ReadPlan(
         tuple(normalized),
         tuple(shape),
         math.prod(shape) * spec.itemsize,
@@ -117,6 +129,25 @@ def plan(spec: ArraySpec, selection: Selection) -> ReadPlan:
         touched * math.prod(spec.chunks) * spec.itemsize,
         live_chunks * math.prod(spec.chunks) * spec.itemsize,
     )
+    if (not spec.dense_gather or buffer_bytes is None or not request.output_bytes
+            or not any(isinstance(s, slice) and s.step > 1 for s in normalized)):
+        return request
+    bounds = tuple(
+        s if isinstance(s, int) else slice(s.start, s.start + (_length(s) - 1) * s.step + 1, 1)
+        for s in normalized
+    )
+    dense = plan(replace(spec, dense_gather=False), bounds)
+    candidate = replace(
+        request, chunks_touched=dense.chunks_touched,
+        decoded_bytes_upper_bound=dense.decoded_bytes_upper_bound,
+        peak_decoded_bytes_upper_bound=dense.peak_decoded_bytes_upper_bound,
+        intermediate_bytes_upper_bound=dense.output_bytes,
+        strategy="dense-gather", read_selection=bounds,
+    )
+    if (candidate.chunks_touched == request.chunks_touched
+            and candidate.buffer_bytes_upper_bound <= buffer_bytes):
+        return candidate
+    return request
 
 
 @dataclass(frozen=True)
@@ -129,7 +160,7 @@ def tiles(spec: ArraySpec, selection: Selection, *, buffer_bytes: int) -> Iterat
     """Yield disjoint output tiles, preferring cuts at existing chunk boundaries."""
     if buffer_bytes < 1:
         raise ValueError("buffer_bytes must be positive")
-    initial = plan(spec, selection)
+    initial = plan(spec, selection, buffer_bytes=buffer_bytes)
     stack = [Tile(initial, tuple(slice(0, n) for n in initial.output_shape))]
     while stack:
         tile = stack.pop()
@@ -169,5 +200,6 @@ def tiles(spec: ArraySpec, selection: Selection, *, buffer_bytes: int) -> Iterat
         ):
             selectors, destinations = list(tile.plan.selection), list(tile.destination)
             selectors[axis], destinations[out_axis] = source, target
-            children.append(Tile(plan(spec, tuple(selectors)), tuple(destinations)))
+            children.append(Tile(
+                plan(spec, tuple(selectors), buffer_bytes=buffer_bytes), tuple(destinations)))
         stack.extend(reversed(children))

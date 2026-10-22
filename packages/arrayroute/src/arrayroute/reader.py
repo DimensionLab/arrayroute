@@ -39,11 +39,18 @@ class ArrayReader:
         if buffer_bytes < 1:
             raise ValueError("buffer_bytes must be positive")
         self.backend = backend
-        self.buffer_bytes = buffer_bytes
+        self.buffer_bytes = (min(buffer_bytes, shared_budget.max_bytes)
+                             if shared_budget is not None else buffer_bytes)
         self.shared_budget = shared_budget
+        if backend.spec.dense_gather and not callable(getattr(backend, "read_plan", None)):
+            raise TypeError("Dense gather metadata requires a backend with read_plan")
+        self._execute: Callable[[ReadPlan], np.ndarray] = getattr(
+            backend, "read_plan", lambda request: backend.read(request.selection))
+        if not callable(self._execute):
+            raise TypeError("Backend read_plan must be callable")
 
     def plan(self, selection: Selection) -> ReadPlan:
-        return plan(self.backend.spec, selection)
+        return plan(self.backend.spec, selection, buffer_bytes=self.buffer_bytes)
 
     def stream(
         self,
@@ -61,7 +68,7 @@ class ArrayReader:
             )
             with reservation:
                 start = time.perf_counter()
-                value = self.backend.read(tile.plan.selection)
+                value = self._execute(tile.plan)
                 if value.shape != tile.plan.output_shape or value.dtype != self.backend.dtype:
                     raise ValueError("Backend returned an unexpected shape or dtype")
                 if stats is not None:
@@ -106,8 +113,9 @@ class ArrayReader:
     ) -> Iterator[Iterator[tuple[Tile, np.ndarray]]]:
         """Overlap one ordered read with the consumer using two budgeted slots.
 
-        Each slot receives half of buffer_bytes for output plus estimated decoded
-        chunks. Backend caches/codec scratch and arrays retained by the consumer
+        Each slot receives half of the effective buffer for output, intermediates and
+        estimated decoded chunks. A shared pool caps the effective reader buffer.
+        Backend caches/codec scratch and arrays retained by the consumer
         beyond the current tile are additional. A chunk must fit in one slot.
         One worker owns all backend reads; do not otherwise read that backend while
         this context is active. Closing waits for an in-flight read: cancellation

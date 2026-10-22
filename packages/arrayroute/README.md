@@ -1068,3 +1068,48 @@ sessions, mutable readers and statistics must not be shared between worker threa
 For TensorStore, `TensorStoreReadGroup.session(read_budget=budget)` composes admission
 with shared native cache/thread controls. The cache soft limit is still separate from
 the planned output/decoded allowance.
+
+## Dense previews without changing stored data
+
+`LocalReadSession(read_strategy="dense")` opts into a bounded native bounding-box
+read followed by an exact in-memory gather. It applies to local Zarr-Python,
+TensorStore and Zarrista sessions, including `TensorStoreReadGroup.session`.
+The default remains `"native"`: measure both on your own regions before choosing.
+
+```python
+from arrayroute.session import LocalReadSession
+
+session = LocalReadSession("zarrista", buffer_bytes=512 << 20, read_strategy="dense")
+reader = session.open("velocity.zarr", "")
+selection = (0, slice(None, None, 8), slice(None, None, 8),
+             slice(None, None, 8), slice(None))
+request = reader.plan(selection)
+print(request.strategy, request.intermediate_bytes_upper_bound,
+      request.buffer_bytes_upper_bound)
+preview = reader.read(selection)
+```
+
+A dense gather is selected only if its bounding box touches exactly the same
+chunks as the strided request and its output, bounding-array intermediate and
+native peak decode estimate fit the effective reader buffer. Sparse requests
+that skip chunks keep native selection. Contiguous and empty requests also keep
+native selection. This is a memory and chunk-work rule, not a timing prediction;
+extra copying can still make it slower on a particular backend or layout.
+The gather copies into a compact C-order output so a small preview cannot retain
+the entire bounding array. Values, including NaN payload bits, are unchanged.
+
+A shared `ReadBudget` caps the effective per-reader buffer at the pool's capacity.
+The planner re-evaluates each stream tile, each half-buffer prefetch slot, and the
+remaining workspace after a materialized output allocation. Intermediates are
+included in shared reservations; native caches, transport and codec scratch remain
+outside the allowance. `reader.buffer_bytes` reports that effective cap.
+
+For custom adapters, `DenseGatherBackend(backend)` supplies this policy. Its
+`ArraySpec.dense_gather` capability requires `read_plan(ReadPlan)` execution.
+`ArrayReader` passes the chosen plan to that method; ordinary unplanned `read`
+calls retain the wrapped backend's original behavior. Wrappers must forward the
+plan on cache misses (`CachedBackend` does). Pure `plan(spec, selection)` has no
+buffer authority and reports native cost; pass `buffer_bytes=` to select a dense
+plan. `plan_concurrency` reports each candidate's strategy (or `per-tile` when
+stream subdivision is needed). Snapshot and remote session constructors do not
+currently expose this opt-in.

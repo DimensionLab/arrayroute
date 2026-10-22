@@ -245,7 +245,9 @@ class CachedBackend:
                           "dtype": self.dtype.str, "schema": 1}
 
     def read(self, selection: Selection) -> np.ndarray:
-        request = plan(self.spec, selection)
+        return self.read_plan(plan(self.spec, selection))
+
+    def read_plan(self, request: ReadPlan) -> np.ndarray:
         encoded = [s if isinstance(s, int) else [s.start, s.stop, s.step]
                    for s in request.selection]
         key = hashlib.sha256(json.dumps({**self._identity, "selection": encoded},
@@ -293,7 +295,8 @@ class CachedBackend:
         return value
 
     def _load(self, key: str, request: ReadPlan, *, cache_value: bool) -> np.ndarray:
-        value = self.source.read(request.selection)
+        execute = getattr(self.source, "read_plan", None)
+        value = execute(request) if execute is not None else self.source.read(request.selection)
         if value.shape != request.output_shape or value.dtype != self.dtype:
             raise ValueError("Source returned an unexpected tile shape or dtype")
         self.stats.source_bytes += value.nbytes
