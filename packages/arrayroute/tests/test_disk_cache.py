@@ -6,7 +6,9 @@ import pickle
 import sqlite3
 import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -23,11 +25,13 @@ class Source:
         self.spec = ArraySpec(value.shape, tuple(min(16, n) for n in value.shape), value.itemsize)
         self.calls = 0
         self.fail = False
+        self.delay = 0.0
 
     def read(self, selection):
         self.calls += 1
         if self.fail:
             raise RuntimeError("Origin unavailable")
+        time.sleep(self.delay)
         return self.value[selection].copy()
 
 
@@ -145,6 +149,7 @@ def _process_read(args):
     path, cold = args
     source = Source(np.arange(64 * 64, dtype=np.float32).reshape(64, 64))
     source.fail = not cold
+    source.delay = 0.1 if cold else 0
     cache = open_cache(path)
     backend = cache.backend(source, identity())
     hashes = []
@@ -171,10 +176,50 @@ def test_independent_workers_share_cache_and_reopen_on_restart(tmp_path):
     expected = hashlib.sha256(np.arange(4096, dtype=np.float32).tobytes()).hexdigest()
     assert all(set(hashes) == {expected} for hashes, _, _, _ in cold + warm)
     assert all(hits == 20 and misses == 0 for _, hits, misses, _ in warm)
+    assert sum(misses for _, _, misses, _ in cold) == 1
     assert len({pid for _, _, _, pid in cold + warm}) == 8
     cache = open_cache(tmp_path)
     assert cache._cache.check() == []
     cache.close()
+
+
+def test_fill_timeout_and_killed_holder_release_the_os_lock(tmp_path):
+    from filelock import Timeout
+
+    cache = TileCache(tmp_path, capacity_bytes=4 << 20, max_entry_bytes=1 << 20,
+                      fill_timeout_seconds=0.03)
+    source = Source(np.arange(256, dtype=np.float32))
+    backend = cache.backend(source, identity())
+    selection = (slice(None),)
+    backend.read(selection)
+    key = next(iter(cache._cache))
+    cache._cache.delete(key)
+    ready = tmp_path / "ready"
+    child = subprocess.Popen([sys.executable, __file__, "--hold-lock",
+                              json.dumps([str(tmp_path), key, str(ready)])])
+    try:
+        deadline = time.monotonic() + 10
+        while not ready.exists():
+            assert child.poll() is None
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        with pytest.raises(Timeout):
+            backend.read(selection)
+        assert source.calls == 1
+    finally:
+        child.kill()
+        child.wait(timeout=10)
+    np.testing.assert_array_equal(backend.read(selection), source.value)
+    assert source.calls == 2
+    assert len(list((tmp_path / "locks").glob("*.lock"))) == 1
+    cache.close()
+
+
+@pytest.mark.parametrize("timeout", [-1, float("inf"), float("nan"), True])
+def test_invalid_fill_timeout(tmp_path, timeout):
+    with pytest.raises(ValueError, match="timeout"):
+        TileCache(tmp_path, capacity_bytes=4 << 20, max_entry_bytes=1 << 20,
+                  fill_timeout_seconds=timeout)
 
 
 def test_invalid_configuration_and_non_numeric_arrays(tmp_path):
@@ -191,6 +236,8 @@ def test_invalid_configuration_and_non_numeric_arrays(tmp_path):
         cache.backend(Source(np.array(["a", "b"], dtype=object)), identity())
     with pytest.raises(TypeError, match="identity|Identity"):
         cache.backend(Source(np.ones(2)), "mutable")
+    with pytest.raises(ValueError, match="source backend directly"):
+        cache.backend(cache.backend(Source(np.ones(2)), identity()), identity())
     cache.close()
 
 
@@ -212,5 +259,12 @@ def test_cache_metadata_cannot_delete_an_external_file(tmp_path):
 
 
 if __name__ == "__main__":
-    assert sys.argv[1] == "--cache-worker"
-    print(json.dumps(_process_read(json.loads(sys.argv[2]))))
+    if sys.argv[1] == "--cache-worker":
+        print(json.dumps(_process_read(json.loads(sys.argv[2]))))
+    else:
+        assert sys.argv[1] == "--hold-lock"
+        path, key, ready = json.loads(sys.argv[2])
+        held_cache = open_cache(path)
+        with held_cache._fill_lock(key):
+            Path(ready).write_text("locked")
+            time.sleep(30)

@@ -764,6 +764,7 @@ cache = TileCache(
     "/local-ssd/my-user/tiles",
     capacity_bytes=8 << 30,
     max_entry_bytes=32 << 20,
+    fill_timeout_seconds=60,
 )
 session = RemoteReadSession(
     HttpStore("https://my-data.example/immutable-snapshot"),
@@ -794,11 +795,19 @@ origin failures and database I/O errors propagate. Hashes detect accidental corr
 not malicious changes to both data and checksum. Cache identity is a caller assertion,
 not source authentication or a snapshot creator.
 
-DiskCache supplies cross-process coordination and LRU eviction. Use a dedicated **local
+DiskCache supplies the cross-process index and LRU eviction. Use a dedicated **local
 filesystem** directory shared only by authorized workers of the same user/tenant;
 do not put this SQLite-backed cache on NFS. It is not a distributed cache or an access
-control boundary. Concurrent misses may fetch the same tile. All workers must agree
-on cache size policy. Serialized cache/session objects reopen in spawned workers.
+control boundary. FileLock hard OS locks coordinate concurrent misses: a waiting worker
+rechecks the cache after the active fill, reusing its result while the entry remains
+retained. Eviction can require another fill. Ordinary cache hits bypass the fill lock.
+The 256 persistent lock stripes bound bookkeeping; unrelated keys on the same stripe
+can wait for each other. A crashed worker releases its OS lock. Waiting longer than
+`fill_timeout_seconds` raises `filelock.Timeout` rather than issuing another source read.
+Only local filesystems with OS hard-lock support are supported; soft-lock fallback is
+disabled. All workers must agree on cache size policy and schema. Schema 2 separates
+coordinated writers from older cache directories: choose a new directory when upgrading
+from schema 1. Serialized cache/session objects reopen in spawned workers.
 
 Capacity is DiskCache's approximate database-plus-payload volume after eviction.
 WAL, filesystem bookkeeping, concurrent writes and temporary files are additional;
@@ -808,3 +817,6 @@ can require two additional output-sized buffers beyond the reader's budget. Back
 `stats` distinguish hits, misses, bypasses, corruptions, hit bytes and source bytes;
 these are tile counts/bytes, not compressed network-transfer measurements. Opening an
 array can still fetch its metadata even when all requested tiles are cached.
+`coalesced_hits` counts hits found after entering the fill lock, and
+`fill_wait_seconds` measures successful fill-lock acquisition time. Keep one backend
+per worker; do not wrap a cached backend in another cache.

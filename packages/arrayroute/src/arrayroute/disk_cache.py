@@ -6,8 +6,10 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import math
 import os
 import tempfile
+import time
 from dataclasses import asdict, dataclass
 from operator import index
 from pathlib import Path
@@ -15,8 +17,9 @@ from pathlib import Path
 import numpy as np
 from diskcache import Cache, Disk
 from diskcache.core import MODE_BINARY, UNKNOWN
+from filelock import FileLock, SoftFileLock
 
-from .plan import Selection, plan
+from .plan import ReadPlan, Selection, plan
 from .reader import Backend
 
 _MAGIC = b"ARTILE01"
@@ -110,6 +113,8 @@ class TileCacheStats:
     bypasses: int = 0
     hit_bytes: int = 0
     source_bytes: int = 0
+    coalesced_hits: int = 0
+    fill_wait_seconds: float = 0.0
 
 
 class TileCache:
@@ -120,21 +125,31 @@ class TileCache:
     use a filesystem quota for a strict disk limit. All workers must use the same policy.
     Source errors propagate. Cache corruption is discarded and read again from source.
     Cache/database I/O errors propagate instead of silently changing the execution policy.
-    A miss is not single-flight: concurrent misses may fetch the same source tile.
+    Misses sharing a key coordinate through 256 stable lock stripes. Waiting workers
+    recheck the cache after the active fill, avoiding duplicate source reads while
+    the entry remains retained. Unrelated keys on the same stripe can briefly wait.
+    The OS releases a crashed process's hard lock; waits have an explicit timeout.
     """
 
-    def __init__(self, directory: str | Path, *, capacity_bytes: int, max_entry_bytes: int):
+    def __init__(self, directory: str | Path, *, capacity_bytes: int, max_entry_bytes: int,
+                 fill_timeout_seconds: float = 60):
         if any(isinstance(v, bool) for v in (capacity_bytes, max_entry_bytes)):
             raise ValueError("Cache limits must be positive integers")
         capacity_bytes, max_entry_bytes = index(capacity_bytes), index(max_entry_bytes)
         if capacity_bytes < 1 << 20 or not 0 < max_entry_bytes <= capacity_bytes // 2:
             raise ValueError("Cache capacity must be >= 1 MiB; entries must be <= half capacity")
+        if (isinstance(fill_timeout_seconds, bool) or not math.isfinite(fill_timeout_seconds)
+                or fill_timeout_seconds < 0):
+            raise ValueError("Fill timeout must be finite and nonnegative")
+        if FileLock is SoftFileLock:
+            raise RuntimeError("Tile cache coordination requires OS hard file locks")
         self.directory = str(Path(directory).absolute())
         self.capacity_bytes = capacity_bytes
         self.max_entry_bytes = max_entry_bytes
+        self.fill_timeout_seconds = fill_timeout_seconds
         root = Path(self.directory)
         root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        policy = json.dumps({"schema": 1, "capacity_bytes": capacity_bytes,
+        policy = json.dumps({"schema": 2, "capacity_bytes": capacity_bytes,
                              "max_entry_bytes": max_entry_bytes}, sort_keys=True).encode()
         fd, temporary = tempfile.mkstemp(prefix="policy-", dir=root)
         try:
@@ -156,10 +171,12 @@ class TileCache:
             cull_limit=1,
             disk_min_file_size=0, disk_max_payload_bytes=max_entry_bytes + _HEADER,
         )
+        (root / "locks").mkdir(exist_ok=True, mode=0o700)
 
     def __getstate__(self):
         return {"directory": self.directory, "capacity_bytes": self.capacity_bytes,
-                "max_entry_bytes": self.max_entry_bytes}
+                "max_entry_bytes": self.max_entry_bytes,
+                "fill_timeout_seconds": self.fill_timeout_seconds}
 
     def __setstate__(self, state):
         self.__init__(**state)
@@ -172,6 +189,12 @@ class TileCache:
 
     def backend(self, source: Backend, identity: ArrayIdentity) -> CachedBackend:
         return CachedBackend(source, self, identity)
+
+    def _fill_lock(self, key: str):
+        return FileLock(Path(self.directory) / "locks" / f"{key[:2]}.lock",
+                        timeout=self.fill_timeout_seconds, poll_interval=0.005,
+                        mode=0o600, thread_local=True, is_singleton=False,
+                        fallback_to_soft=False, preserve_lock_file=True)
 
 
 class CachedBackend:
@@ -186,6 +209,8 @@ class CachedBackend:
     """
 
     def __init__(self, source: Backend, cache: TileCache, identity: ArrayIdentity):
+        if isinstance(source, CachedBackend):
+            raise ValueError("Wrap the source backend directly, not another cached backend")
         if not isinstance(identity, ArrayIdentity):
             raise TypeError("Provide an explicit immutable ArrayIdentity")
         self.source, self.cache = source, cache
@@ -203,34 +228,53 @@ class CachedBackend:
         key = hashlib.sha256(json.dumps({**self._identity, "selection": encoded},
                                        sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         eligible = 0 < request.output_bytes <= self.cache.max_entry_bytes
-        if eligible:
+        if not eligible:
+            self.stats.bypasses += 1
+            return self._load(key, request, cache_value=False)
+        try:
+            value = self._cached(key, request)
+            if value is not None:
+                return value
+        except CacheCorruptionError:
+            pass  # Recheck under the fill lock before removing a possibly repaired entry.
+        started = time.perf_counter()
+        with self.cache._fill_lock(key):
+            self.stats.fill_wait_seconds += time.perf_counter() - started
             try:
-                stream = self.cache._cache.get(key, default=None, read=True)
-                if stream is not None:
-                    if not isinstance(stream, io.BufferedReader):
-                        raise CacheCorruptionError("Tile cache value is not a binary stream")
-                    with stream:
-                        header = stream.read(_HEADER)
-                        value = np.empty(request.output_shape, dtype=self.dtype)
-                        payload = memoryview(value).cast("B")
-                        size = stream.readinto(payload)
-                        if (size != request.output_bytes or header[:8] != _MAGIC
-                                or stream.read(1) or _digest(key, payload) != header[8:_HEADER]):
-                            raise CacheCorruptionError("Tile cache checksum or size differs")
-                    self.stats.hits += 1
-                    self.stats.hit_bytes += value.nbytes
+                value = self._cached(key, request)
+                if value is not None:
+                    self.stats.coalesced_hits += 1
                     return value
             except CacheCorruptionError:
                 self.cache._cache.delete(key)
                 self.stats.corruptions += 1
             self.stats.misses += 1
-        else:
-            self.stats.bypasses += 1
+            return self._load(key, request, cache_value=True)
+
+    def _cached(self, key: str, request: ReadPlan) -> np.ndarray | None:
+        stream = self.cache._cache.get(key, default=None, read=True)
+        if stream is None:
+            return None
+        if not isinstance(stream, io.BufferedReader):
+            raise CacheCorruptionError("Tile cache value is not a binary stream")
+        with stream:
+            header = stream.read(_HEADER)
+            value = np.empty(request.output_shape, dtype=self.dtype)
+            payload = memoryview(value).cast("B")
+            size = stream.readinto(payload)
+            if (size != request.output_bytes or header[:8] != _MAGIC
+                    or stream.read(1) or _digest(key, payload) != header[8:_HEADER]):
+                raise CacheCorruptionError("Tile cache checksum or size differs")
+        self.stats.hits += 1
+        self.stats.hit_bytes += value.nbytes
+        return value
+
+    def _load(self, key: str, request: ReadPlan, *, cache_value: bool) -> np.ndarray:
         value = self.source.read(request.selection)
         if value.shape != request.output_shape or value.dtype != self.dtype:
             raise ValueError("Source returned an unexpected tile shape or dtype")
         self.stats.source_bytes += value.nbytes
-        if eligible:
+        if cache_value:
             payload = np.ascontiguousarray(value).tobytes()
             digest = _digest(key, payload)
             self.cache._cache.set(key, _MAGIC + digest + payload)
