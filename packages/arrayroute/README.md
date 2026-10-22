@@ -189,7 +189,8 @@ For this layout, a frame needs 48 MiB for output plus the decoded-chunk estimate
 Four or five readers can each issue one full-frame request; eight readers need eight
 tile requests per frame. Candidates include powers of two and the untiled boundary.
 Benchmark the candidates on the intended storage; this is not a throughput prediction.
-For variable-size samples, plan the largest selected shape, or plan each size bucket.
+For variable requests, plan the largest memory requirement, including chunk alignment
+and layout as well as shape, or plan each request bucket separately.
 
 Planning does not read values or enumerate the dataset. Tile counts stop after a
 bounded prefix and report a lower bound when `request_count_exact` is false. A selection

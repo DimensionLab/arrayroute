@@ -44,8 +44,9 @@ def plan_concurrency(
     """Suggest bounded benchmark candidates without reading values or indexing the dataset.
 
     Include powers of two, the requested ceiling and the largest untiled worker count.
-    Budgets use ArrayReader.read's materialization rules. Each reader handles the same
-    selection shape; callers with variable shapes must plan their largest requirement.
+    Budgets use ArrayReader.read's materialization rules. Each reader has the same
+    selection cost. For variable requests, plan the largest requirement, including
+    chunk alignment and layout as well as shape.
     The tile count stops after count_limit + 1 tiles and is then a lower bound. Thus
     metadata planning does not enumerate all tiles of a TB/PB selection. Worker counts
     are capped by the number of bytes available, since each reader needs a positive budget.
