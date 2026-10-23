@@ -5,14 +5,41 @@ from __future__ import annotations
 
 import operator
 import threading
+import time
 from collections import deque
 from collections.abc import Callable, Generator, Iterable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager
-from typing import Generic, TypeVar
+from dataclasses import dataclass
+from typing import Generic, Literal, TypeVar
 
 T = TypeVar("T")
 R = TypeVar("R")
+PoolPhase = Literal["admitted", "started", "finished", "delivered", "released"]
+
+
+@dataclass(frozen=True, slots=True)
+class PoolEvent:
+    """A task lifecycle observation; timestamps share this process's monotonic clock."""
+
+    phase: PoolPhase
+    task_index: int
+    timestamp_ns: int
+    thread_id: int
+    failed: bool = False
+
+
+PoolObserver = Callable[[PoolEvent], None]
+
+
+def _observe(
+    observer: PoolObserver | None, phase: PoolPhase,
+    task_index: int, *, failed: bool = False,
+) -> None:
+    if observer is not None:
+        observer(PoolEvent(
+            phase, task_index, time.perf_counter_ns(), threading.get_ident(), failed,
+        ))
 
 
 class ProcessingCancelledError(InterruptedError):
@@ -71,24 +98,42 @@ class OrderedPool(Generic[T, R]):
             max_workers=workers, thread_name_prefix="arrayroute-map"
         )
 
-    def _execute(self, item: T, check: Callable[[], None]) -> R:
+    def _execute(
+        self, item: T, check: Callable[[], None], observer: PoolObserver | None, task_index: int,
+    ) -> R:
         check()
-        if not hasattr(self._local, "process"):
-            self._local.process = self._make_worker()
-        return self._local.process(item)
+        _observe(observer, "started", task_index)
+        failed = True
+        try:
+            if not hasattr(self._local, "process"):
+                self._local.process = self._make_worker()
+            result = self._local.process(item)
+            failed = False
+            return result
+        finally:
+            _observe(observer, "finished", task_index, failed=failed)
 
     @contextmanager
     def map(
-        self, items: Iterable[T], *, cancelled: Callable[[], bool] | None = None
+        self, items: Iterable[T], *, cancelled: Callable[[], bool] | None = None,
+        observer: PoolObserver | None = None,
     ) -> Iterator[Iterator[R]]:
-        """Consume in input order; the caller retains ownership of the input iterable."""
+        """Consume in input order; the caller retains ownership of the input iterable.
+
+        An optional observer runs synchronously on producer/worker/consumer threads.
+        It must be thread-safe; its overhead affects execution. Observer exceptions
+        fail the pass. Events contain sequence numbers, not input or output values.
+        Indices restart each pass. A release means the pool drops its output reference,
+        not that a caller-retained value is freed. Cancelled queued work may have only
+        an admission event. No timestamps or event objects are made without an observer.
+        """
         with self._state_lock:
             if self._closed:
                 raise RuntimeError("Ordered pool is closed")
             if self._active:
                 raise RuntimeError("Concurrent map contexts are not supported")
             self._active = True
-        pending: deque[tuple[Future[R], int]] = deque()
+        pending: deque[tuple[Future[R], int, int]] = deque()
 
         def check() -> None:
             if self._closed:
@@ -101,6 +146,7 @@ class OrderedPool(Generic[T, R]):
             exhausted = False
             deferred: tuple[T, int] | None = None
             admitted_bytes = 0
+            task_index = 0
             while True:
                 check()
                 while not exhausted and len(pending) < self._capacity:
@@ -129,33 +175,43 @@ class OrderedPool(Generic[T, R]):
                         deferred = (item, amount)
                         del item
                         break
-                    pending.append((self._executor.submit(self._execute, item, check), amount))
+                    _observe(observer, "admitted", task_index)
+                    pending.append((self._executor.submit(
+                        self._execute, item, check, observer, task_index,
+                    ), amount, task_index))
                     admitted_bytes += amount
+                    task_index += 1
                     del item
                 if not pending:
                     return
                 # Keep the awaited future in the deque so cleanup also waits for it
                 # if the consumer is interrupted while future.result() is waiting.
-                future, amount = pending[0]
+                future, amount, index = pending[0]
                 result = future.result()
                 pending.popleft()
                 del future
                 check()
-                yield result
-                del result
-                admitted_bytes -= amount
+                _observe(observer, "delivered", index)
+                try:
+                    yield result
+                finally:
+                    del result
+                    admitted_bytes -= amount
+                    _observe(observer, "released", index)
 
         output = iterate()
         try:
             yield output
         finally:
             try:
-                for future, _ in pending:
+                for future, _, _ in pending:
                     future.cancel()
                 if pending:
-                    wait(future for future, _ in pending)
-                output.close()
-                pending.clear()
+                    wait(future for future, _, _ in pending)
+                try:
+                    output.close()
+                finally:
+                    pending.clear()
             finally:
                 with self._state_lock:
                     self._active = False
@@ -187,6 +243,7 @@ def ordered_map(
     max_pending_bytes: int | None = None,
     estimate_bytes: Callable[[T], int] | None = None,
     cancelled: Callable[[], bool] | None = None,
+    observer: PoolObserver | None = None,
 ) -> Iterator[Iterator[R]]:
     """Run one bounded pass and release its thread-owned workers on context exit.
 
@@ -195,5 +252,5 @@ def ordered_map(
     """
     with OrderedPool(make_worker, workers=workers, max_pending=max_pending,
                      max_pending_bytes=max_pending_bytes, estimate_bytes=estimate_bytes) as pool:
-        with pool.map(items, cancelled=cancelled) as output:
+        with pool.map(items, cancelled=cancelled, observer=observer) as output:
             yield output

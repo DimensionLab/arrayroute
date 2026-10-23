@@ -1495,6 +1495,21 @@ effects, and it need not choose the fastest path. Persist the threshold alongsid
 the data revision and execution settings; do not change it from live timings when
 reproducing a run.
 
+## Observe ordered execution
+
+`OrderedPool.map(..., observer=callback)` and `ordered_map(..., observer=callback)`
+emit immutable `PoolEvent` records for task admission, start, finish, ordered delivery
+and release. Each record contains the per-pass task index, monotonic nanosecond
+timestamp, thread ID and failure flag. It contains no input or output values.
+The callback runs synchronously on multiple threads and must be thread-safe;
+its overhead affects timings and exceptions fail the pass. With no observer,
+execution does not allocate event records or sample the trace clock.
+
+Use tracing in a separate diagnostic pass. A release only means that the pool has
+dropped its output reference; callers may retain that output. Early cancellation
+can leave admitted tasks without completion events. Bound any collector's storage,
+record truncation and wait for pool cleanup before exporting the trace.
+
 ## Measure reader and worker memory
 
 Install `arrayroute[profiling]` to sample a process tree without a framework dependency:
