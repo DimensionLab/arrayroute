@@ -68,6 +68,33 @@ statistics from bounded buffers, with optional per-channel validity masks. It ke
 counts and centred float64 moments; missing observations do not contaminate the result.
 This is useful for normalization over training splits or distributed preprocessing. The
 caller controls partition assignment, read buffering and the reduction order.
+Its floating-point result depends on grouping; it is not a bitwise-reproducible
+distributed reduction.
+
+For ordered normalization, use `CanonicalChannelMoments(channels)` from the same
+module. It reduces fixed 4096-row leaves in stream order, regardless of the sizes
+of buffers passed to `update(values, valid=None)`. It exposes `count`, `mean`,
+`variance` and `mean_square`; `snapshot()` returns an independent result without
+changing subsequent reduction boundaries. Validity is per channel. C-contiguous,
+Fortran-contiguous and strided inputs follow the same C row order. The persistent
+leaf buffer is 4096 × channels × 9 bytes, plus the channel accumulators; conversion
+and validation of a caller buffer may need additional temporary memory.
+Accumulation stays relative to each channel's first valid observation, avoiding
+loss of small between-leaf differences when physical values have a large offset.
+
+Save `CanonicalChannelMoments.ALGORITHM`, the ordered immutable input identities,
+NumPy version and numerical execution environment. This contract guarantees read
+partition independence in the same numerical runtime, not arbitrary input order
+or unverified CPU/GPU equivalence. Parallel readers must deliver global stream
+order before reduction. Do not merge independently accumulated partial streams
+or restore a reduction from its snapshot: a snapshot does not contain the pending
+leaf needed to continue exactly.
+
+Measure a real local time-first, channel-last Zarr v3 array with
+`python -m arrayroute.benchmark_statistics --store /path/to/array.zarr --output results.json`.
+The benchmark hashes every input pass, checks exact canonical replay across read
+sizes, and records read, reduction and hashing time separately. It does not flush
+the filesystem cache or establish cross-platform reproducibility.
 
 `arrayroute.windows.WindowIndex(lengths, history=2, unroll=4, lead=1)` maps a training-window
 number to its trajectory and last input frame. Its metadata scales with trajectory count,
