@@ -1675,3 +1675,42 @@ small arrays and a single NumExpr thread may be slower. Byte equality is tested
 against NumPy on validation hosts, not promised across arbitrary hardware,
 compiler and library combinations. Record the software stack with benchmark and
 reproducibility results.
+
+### Full-array differences without full-array materialization
+
+`compare_array_readers` scans every value for change counts, finite-value moments and
+finite-pair difference metrics. It only samples percentiles, and reports that sampling scope
+and count explicitly. NaN payload and signed-zero changes are counted separately from
+numerical changes.
+
+```python
+from arrayroute.difference import compare_array_readers
+from arrayroute.session import LocalReadSession
+
+session = LocalReadSession(buffer_bytes=64 << 20)
+report = compare_array_readers(
+    session.open("before.zarr", "fields/velocity"),
+    session.open("after.zarr", "fields/velocity"),
+    percentile_samples=65536,
+)
+assert report["comparison_scope"] == "full_array"
+print(report["n_changed"], report["n_bitwise_changed"])
+```
+
+Sources must remain immutable throughout the call. Reads batch according to the allowance;
+reductions keep fixed 65,536-element C-order blocks so read batching does not change the
+numerical result. Replay pins the numerical environment. Matching shape and dtype are
+required for paired metrics; otherwise the report describes the structural change and
+separate summaries. Real fixed-size numeric dtypes up to 64 bits are supported.
+
+Counts and native min/max do not round through floating point. Moments, percentiles and
+norms use float64; integer differences beyond float64 precision are not exact numerical
+error measurements. The report distinguishes numeric precision from bitwise change counts.
+Nonfinite pairs are excluded from numerical differences and counted in each input summary.
+
+Memory includes each reader's allowance, two bounded read batches, fixed numerical scratch
+and a separately capped percentile workspace (`max_sample_bytes`, default 128 MiB).
+Percentile admission conservatively accounts for indices, values and selection scratch.
+This is not a process-RSS cap; native caches, codec scratch and encoded input are excluded.
+Pass `cancelled=` for cooperative cancellation between reads and reduction blocks. Corrupt
+reads and unsupported inputs fail explicitly, without returning partial success.
