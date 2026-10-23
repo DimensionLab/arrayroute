@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 
+from .plan import Selection
 from .reader import ArrayReader, ReadStats
 from .statistics import CanonicalChannelMoments
 
@@ -35,14 +37,47 @@ def _regions(shape: tuple[int, ...], start: int, stop: int,
             start += end - offset
 
 
-def _block(reader: ArrayReader, start: int, stop: int, stats: ReadStats,
+@dataclass(frozen=True)
+class _Source:
+    reader: ArrayReader
+    selection: Selection
+    shape: tuple[int, ...]
+    explicit: bool
+
+    @classmethod
+    def create(cls, reader: ArrayReader, selection: Selection | None) -> _Source:
+        request = reader.plan(selection if selection is not None else
+                              (slice(None),) * len(reader.backend.spec.shape))
+        return cls(reader, request.selection, request.output_shape, selection is not None)
+
+    def map_region(self, region: Selection) -> Selection:
+        indices = iter(region)
+        mapped: list[int | slice] = []
+        for source in self.selection:
+            if isinstance(source, int):
+                mapped.append(source)
+                continue
+            local = next(indices)
+            if isinstance(local, int):
+                mapped.append(source.start + local * source.step)
+            else:
+                length = len(range(source.start, source.stop, source.step))
+                start, stop, step = local.indices(length)
+                mapped.append(slice(source.start + start * source.step,
+                                    min(source.stop, source.start + stop * source.step),
+                                    source.step * step))
+        return tuple(mapped)
+
+
+def _block(source: _Source, start: int, stop: int, stats: ReadStats,
            cancelled: Callable[[], bool] | None) -> np.ndarray:
+    reader = source.reader
     out = np.empty(stop - start, dtype=reader.backend.dtype)
     offset = 0
-    for selection in _regions(reader.backend.spec.shape, start, stop):
+    for selection in _regions(source.shape, start, stop):
         if cancelled is not None and cancelled():
             raise InterruptedError('Array comparison cancelled')
-        values = reader.read(selection, stats=stats)
+        values = reader.read(source.map_region(selection), stats=stats)
         out[offset:offset + values.size] = values.reshape(-1)
         offset += values.size
         del values
@@ -103,11 +138,15 @@ class _Summary:
 
 def compare_array_readers(
     before: ArrayReader | None, after: ArrayReader | None, *,
+    before_selection: Selection | None = None, after_selection: Selection | None = None,
     percentile_samples: int = 65536, max_sample_bytes: int = 128 << 20,
     cancelled: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Scan all values; only percentile estimates are sampled.
 
+    Optional selections compare all values of those regions, in selected C order. Source
+    selections accept the reader's integer/positive-stride slice contract. Original chunk
+    admission applies after mapping each bounded region; no full selection is materialized.
     Source metadata and payloads must stay immutable during the call. Exact counts and
     native min/max cover every element. Float64 moments and norms use fixed 65,536-value
     C-order blocks; replay pins NumPy/runtime. Integer counts do not round through floats.
@@ -128,8 +167,13 @@ def compare_array_readers(
         raise ValueError('max_sample_bytes must be a positive integer')
     if before is None and after is None:
         raise ValueError('At least one array is required')
-    readers = [r for r in (before, after) if r is not None]
-    counts = [math.prod(r.backend.spec.shape) for r in readers]
+    if ((before is None and before_selection is not None)
+            or (after is None and after_selection is not None)):
+        raise ValueError('A selection requires its source array')
+    sources = [_Source.create(r, s) for r, s in
+               ((before, before_selection), (after, after_selection)) if r is not None]
+    readers = [s.reader for s in sources]
+    counts = [math.prod(s.shape) for s in sources]
     for reader, count in zip(readers, counts, strict=True):
         if reader.backend.dtype.kind not in 'biuf' or reader.backend.dtype.itemsize > 8:
             raise TypeError('Comparison requires fixed-size real numeric arrays of at most 64 bits')
@@ -143,7 +187,7 @@ def compare_array_readers(
     summaries = [_Summary(c, percentile_samples) for c in counts]
     stats = [ReadStats() for _ in readers]
     same = (before is not None and after is not None
-            and before.backend.spec.shape == after.backend.spec.shape
+            and sources[0].shape == sources[1].shape
             and before.backend.dtype == after.backend.dtype)
     changed = bits_changed = 0
     delta_max = norm_a = norm_delta = 0.0
@@ -151,10 +195,10 @@ def compare_array_readers(
         r.buffer_bytes // (2*r.backend.dtype.itemsize*BLOCK_ELEMENTS) for r in readers
     )))
     for batch_start in range(0, max(counts), batch_elements):
-        batches = [(_block(r, batch_start, min(c, batch_start + batch_elements),
+        batches = [(_block(s, batch_start, min(c, batch_start + batch_elements),
                            stats[i], cancelled)
                     if batch_start < c else None)
-                   for i, (r, c) in enumerate(zip(readers, counts, strict=True))]
+                   for i, (s, c) in enumerate(zip(sources, counts, strict=True))]
         for start in range(batch_start, min(max(counts), batch_start + batch_elements),
                            BLOCK_ELEMENTS):
             if cancelled is not None and cancelled():
@@ -189,15 +233,24 @@ def compare_array_readers(
                 scale = float(np.abs(aa).max()) if aa.size else 0.0
                 if scale:
                     norm_a = math.hypot(norm_a, scale*float(np.linalg.norm(aa/scale)))
-    result: dict[str, Any] = {'algorithm': ALGORITHM, 'comparison_scope': 'full_array',
+    scope = 'full_selection' if any(s.explicit for s in sources) else 'full_array'
+    result: dict[str, Any] = {'algorithm': ALGORITHM, 'comparison_scope': scope,
                               'read_batch_elements': batch_elements}
     index = 0
     for name, reader in (('before', before), ('after', after)):
-        result['n_' + name] = None if reader is None else math.prod(reader.backend.spec.shape)
+        result['n_' + name] = None if reader is None else counts[index]
         if reader is not None:
-            result['shape_' + name] = list(reader.backend.spec.shape)
+            source = sources[index]
+            result['shape_' + name] = list(source.shape)
+            result['source_shape_' + name] = list(reader.backend.spec.shape)
+            result['selection_' + name] = [v if isinstance(v, int) else
+                                           [v.start, v.stop, v.step] for v in source.selection]
             result['dtype_' + name] = reader.backend.dtype.str
             result[name] = summaries[index].result()
+            if source.explicit:
+                result[name]['statistics_scope'] = 'full_selection'
+                if result[name]['percentile_scope'] == 'full_array':
+                    result[name]['percentile_scope'] = 'full_selection'
             result['read_' + name] = vars(stats[index])
             index += 1
     if same:
@@ -209,6 +262,6 @@ def compare_array_readers(
                       metric_precision='float64; nonfinite pairs excluded from differences')
     else:
         result['note'] = ('added' if before is None else 'removed' if after is None else
-                          'shape changed' if before.backend.spec.shape != after.backend.spec.shape
+                          'shape changed' if sources[0].shape != sources[1].shape
                           else 'dtype changed')
     return result

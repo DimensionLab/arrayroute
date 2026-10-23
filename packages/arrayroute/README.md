@@ -1714,3 +1714,12 @@ Percentile admission conservatively accounts for indices, values and selection s
 This is not a process-RSS cap; native caches, codec scratch and encoded input are excluded.
 Pass `cancelled=` for cooperative cancellation between reads and reduction blocks. Corrupt
 reads and unsupported inputs fail explicitly, without returning partial success.
+
+### Selected comparisons
+
+`compare_array_readers` also accepts `before_selection` and `after_selection` tuples of
+integers and positive-stride slices. It compares every selected value in C order without
+materializing the full region. Regions may have different origins or source shapes; their
+selected shape and dtype must agree for paired metrics. The report retains both source
+shapes and normalized selections, and uses `comparison_scope="full_selection"` when a
+selection was supplied. Original chunk admission still applies to every mapped read.

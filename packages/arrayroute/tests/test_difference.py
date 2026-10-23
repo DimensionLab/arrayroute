@@ -149,3 +149,56 @@ def test_cancellation_during_comparison_stops_without_partial_result():
     with pytest.raises(InterruptedError):
         compare_array_readers(r, r, cancelled=cancelled)
     assert len(r.backend.reads) < 20
+
+
+@pytest.mark.parametrize('selection', [
+    (slice(2, 23, 3), slice(1, 97, 2), slice(5, 53, 3)),
+    (-1, slice(None, None, 3), slice(2, 9)),
+    (3, -2, 7),
+    (slice(2, 2), slice(None), slice(None)),
+    (slice(None), slice(None), slice(None)),
+])
+def test_selected_comparison_matches_materialized_reference(selection):
+    a = np.arange(23*97*53, dtype=np.int64).reshape(23, 97, 53)
+    b = a.copy()
+    b[::2, 1::3, ::4] += 100
+    ra, rb = reader(a), reader(b)
+    result = compare_array_readers(ra, rb, before_selection=selection,
+                                   after_selection=selection, percentile_samples=19)
+    aa, bb = np.asarray(a[selection]), np.asarray(b[selection])
+    assert result['comparison_scope'] == 'full_selection'
+    assert result['n_before'] == aa.size
+    assert result['shape_after'] == list(bb.shape)
+    assert result['source_shape_after'] == list(b.shape)
+    assert result['n_changed'] == int((aa != bb).sum())
+    assert result['max_abs_diff'] == (float(np.max(np.abs(bb-aa))) if aa.size else 0)
+    assert result['before']['statistics_scope'] == 'full_selection'
+    if aa.size:
+        assert result['before']['mean'] == pytest.approx(aa.mean())
+    else:
+        assert not ra.backend.reads and not rb.backend.reads
+
+
+def test_regions_can_have_different_origins_and_source_shapes():
+    a = np.arange(2*BLOCK_ELEMENTS + 17, dtype=np.float32)
+    b = np.pad(a, (7, 9), constant_values=-999)
+    result = compare_array_readers(reader(a), reader(b),
+                                   after_selection=(slice(7, -9),))
+    assert result['n_changed'] == 0
+    assert result['shape_before'] == result['shape_after']
+    assert result['source_shape_before'] != result['source_shape_after']
+    assert result['before']['statistics_scope'] == 'full_array'
+    assert result['after']['statistics_scope'] == 'full_selection'
+
+
+@pytest.mark.parametrize('selection', [(slice(None, None, -1),), (True,), (999,), ()])
+def test_invalid_region_fails_before_payload_reads(selection):
+    r = reader(np.ones(5))
+    with pytest.raises((ValueError, IndexError, TypeError)):
+        compare_array_readers(r, r, before_selection=selection)
+    assert not r.backend.reads
+
+
+def test_selection_without_source_is_rejected():
+    with pytest.raises(ValueError, match='selection requires'):
+        compare_array_readers(None, reader(np.ones(5)), before_selection=(slice(None),))
