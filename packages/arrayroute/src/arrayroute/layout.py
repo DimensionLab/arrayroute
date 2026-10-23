@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from operator import index
 
@@ -24,7 +24,7 @@ class GridLayoutPolicy:
 
     Spatial edges are upper targets. Byte limits include padded edge blocks. Time steps
     are kept in separate shards by default; requested steps_per_chunk is an upper bound.
-    Component/other axes stay together unless the decoded-byte limit requires a split.
+    Component/other axes stay together unless explicit axis caps or the byte limit split them.
     No values are read and no numerical conversion is performed.
     """
 
@@ -50,6 +50,7 @@ class GridLayoutPolicy:
         spatial_axes: Sequence[int],
         time_axis: int | None = None,
         steps_per_chunk: int = 1,
+        axis_chunk_limits: Mapping[int, int] | None = None,
     ) -> GridLayout:
         shape = tuple(index(n) for n in shape)
         axes = tuple(index(a) for a in spatial_axes)
@@ -70,6 +71,15 @@ class GridLayoutPolicy:
             chunks[axis] = min(shape[axis], self.chunk_edge)
         if time_axis is not None:
             chunks[time_axis] = min(shape[time_axis], steps)
+        for raw_axis, raw_limit in (axis_chunk_limits or {}).items():
+            if isinstance(raw_axis, bool) or isinstance(raw_limit, bool):
+                raise TypeError("Axis chunk limits require integer axes and extents, not booleans")
+            axis, limit = index(raw_axis), index(raw_limit)
+            if not 0 <= axis < len(shape) or limit < 1:
+                raise ValueError(
+                    "Axis chunk limits require an axis within array rank and extent >= 1"
+                )
+            chunks[axis] = min(chunks[axis], limit)
         while math.prod(chunks) * itemsize > self.chunk_bytes:
             axis = max(range(len(shape)), key=lambda i: chunks[i])
             chunks[axis] = max(1, chunks[axis] // 2)

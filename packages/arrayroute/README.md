@@ -532,6 +532,24 @@ not an automatically optimal layout. Full-volume training, sparse regions, objec
 and local filesystems can favor different choices. The policy neither converts values nor
 selects a compressor; lossless versus lossy encoding remains explicit.
 
+Use `axis_chunk_limits` when an access pattern needs individual components, levels,
+or another axis split into smaller blocks. Limits combine with the time, spatial,
+and byte bounds; they never enlarge a chunk. For example, a T,Z,Y,X,C weather array
+can keep a vertical column and 16 time steps together while separating variables:
+
+```python
+station_layout = GridLayoutPolicy(chunk_edge=1, shard_edge=32).plan(
+    (192, 13, 33, 81, 5), itemsize=4, spatial_axes=(2, 3),
+    time_axis=0, steps_per_chunk=16, axis_chunk_limits={4: 1},
+)
+# chunks=(16,13,1,1,1), shards=(16,13,32,32,1), at most 360 storage objects
+```
+
+This layout avoids decoding neighboring stations for one column, provided the reader
+supports partial shard decoding. It increases the number of chunks needed for full
+spatial windows. Measure both workloads before choosing it or retaining an additional
+representation. The plan is deterministic and independent of mapping insertion order.
+
 ## Pin reads to a dataset revision
 
 Install `arrayroute[snapshots]` on **Python 3.12 or newer** for the optional Icechunk 2.3

@@ -69,3 +69,39 @@ def test_invalid_policy(options):
 def test_invalid_grid(shape, axes, time):
     with pytest.raises(ValueError):
         GridLayoutPolicy().plan(shape, itemsize=4, spatial_axes=axes, time_axis=time)
+
+
+def test_station_columns_split_variables_and_preserve_bounded_objects():
+    from arrayroute import ArraySpec, plan
+
+    shape = (192, 13, 33, 81, 5)
+    layout = GridLayoutPolicy(chunk_edge=1, shard_edge=32).plan(
+        shape, itemsize=4, spatial_axes=(2, 3), time_axis=0,
+        steps_per_chunk=16, axis_chunk_limits={4: 1},
+    )
+    assert layout.chunks == (16, 13, 1, 1, 1)
+    assert layout.shards == (16, 13, 32, 32, 1)
+    assert layout.object_count_upper_bound == 360
+    request = plan(ArraySpec(shape, layout.chunks, 4),
+                   (slice(None), slice(None), slice(16, 17), slice(40, 41), slice(0, 1)))
+    assert request.output_bytes == request.decoded_bytes_upper_bound == 9984
+    assert request.chunks_touched == 12
+
+
+def test_axis_caps_compose_with_time_spatial_and_byte_limits_deterministically():
+    policy = GridLayoutPolicy(chunk_bytes=2048, shard_bytes=8192)
+    options = dict(itemsize=4, spatial_axes=(1, 2), time_axis=0, steps_per_chunk=8)
+    first = policy.plan((100, 129, 131, 50), axis_chunk_limits={0: 3, 1: 7, 3: 2}, **options)
+    second = policy.plan((100, 129, 131, 50), axis_chunk_limits={3: 2, 1: 7, 0: 3}, **options)
+    assert first == second
+    assert first.chunks[0] <= 3 and first.chunks[1] <= 7 and first.chunks[3] <= 2
+    assert first.decoded_chunk_bytes <= 2048 and first.decoded_shard_bytes <= 8192
+
+
+@pytest.mark.parametrize(
+    "limits", [{-1: 1}, {3: 1}, {1: 0}, {1: -1}, {1: 1.5}, {True: 1}, {1: True}]
+)
+def test_invalid_axis_caps(limits):
+    with pytest.raises((TypeError, ValueError)):
+        GridLayoutPolicy().plan((20, 30, 4), itemsize=4, spatial_axes=(0, 1),
+                                axis_chunk_limits=limits)
