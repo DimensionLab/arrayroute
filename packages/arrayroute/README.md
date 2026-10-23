@@ -500,6 +500,37 @@ with the same tolerance over disjoint blocks. Comparison scratch is proportional
 supplied block, so keep blocks bounded. This checks field reconstruction only; accuracy
 of gradients, integrals, spectra or other derived quantities needs its own assessment.
 
+For an opt-in lossy derivative, `arrayroute.codec_guard.encode_verified` also checks
+the codec's actual output before accepting it:
+
+```python
+from arrayroute.codec_guard import encode_verified
+
+verified = encode_verified(
+    velocity_block,
+    encoder=lambda values, bound: codec.compress(values, absolute_error=bound),
+    decoder=codec.decompress,
+    absolute_tolerance=0.01,
+    unit="m/s",
+)
+restored = verified.decode(codec.decompress)
+```
+
+Adapt the two callbacks to your codec; they must preserve the block's shape and dtype.
+Finite float blocks up to 256 MiB are supported. A numerical overrun halves the internal
+codec bound and retries at most four times by default; the declared physical-unit
+tolerance never changes. An accepted encoding must repeat with identical compressed
+and reconstructed bytes. Later reads reject changed payloads, layouts or decoded bytes.
+The caller's source is protected by a separate immutable snapshot.
+
+Retain the original lossless source and store the receipt alongside its payload, codec
+version and provenance in your artifact store. Hashes detect drift but do not authenticate
+untrusted receipts. Codec callbacks are trusted native code, not sandboxed. Memory use
+includes copies and float64 assessment buffers beyond the source block size. Measure
+total write time including retries, validation and repeatability checks; native codec
+throughput alone is insufficient. Repeated calls here do not prove cross-device
+determinism; a later decode mismatch is reported rather than silently accepted.
+
 ## Spatial grid storage policy
 
 `arrayroute.layout.GridLayoutPolicy` chooses bounded spatial chunks and optional Zarr v3
