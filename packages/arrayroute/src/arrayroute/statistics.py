@@ -85,6 +85,7 @@ class CanonicalChannelMoments:
         self._values = np.empty((self.LEAF_ROWS, channels), dtype=np.float64)
         self._valid = np.empty((self.LEAF_ROWS, channels), dtype=bool)
         self._pending = 0
+        self._rows_seen = 0
         self._origin = np.zeros(channels, dtype=np.float64)
         self._origin_set = np.zeros(channels, dtype=bool)
 
@@ -99,6 +100,8 @@ class CanonicalChannelMoments:
         if not np.all(np.isfinite(values) | (False if valid is None else ~valid)):
             raise ValueError("Nonfinite observations inside the validity mask")
         rows = values.reshape(-1, channels)
+        if len(rows) > np.iinfo(np.int64).max - self._rows_seen:
+            raise OverflowError("Observation row count exceeds int64 capacity")
         mask = None if valid is None else valid.reshape(-1, channels)
         first = 0
         while first < len(rows):
@@ -110,6 +113,7 @@ class CanonicalChannelMoments:
                 self._accumulate_leaves(
                     rows[first:stop], None if mask is None else mask[first:stop]
                 )
+                self._rows_seen += stop - first
                 first = stop
                 continue
             count = min(len(rows) - first, self.LEAF_ROWS - self._pending)
@@ -123,6 +127,32 @@ class CanonicalChannelMoments:
                     self._moments, self._values, self._valid, self._origin, self._origin_set
                 )
                 self._pending = 0
+            self._rows_seen += count
+
+    @property
+    def rows_seen(self) -> int:
+        """Consumed rows, including masked rows; excludes prefetched/unsubmitted data."""
+        return self._rows_seen
+
+    def checkpoint(self, *, contract_digest: str) -> bytes:
+        """Serialize exact state bound to a SHA-256 pipeline contract.
+
+        The caller's contract must pin immutable inputs, row order, transformations,
+        masks and numerical environment. Persist these bytes atomically; restart the
+        same stream at ``rows_seen``. A checksum detects corruption, not tampering.
+        """
+        from ._moments_checkpoint import encode
+
+        return encode(self, contract_digest)
+
+    @classmethod
+    def from_checkpoint(
+        cls, data: bytes, *, contract_digest: str, max_state_bytes: int = 64 << 20,
+    ) -> CanonicalChannelMoments:
+        """Restore after integrity, contract, runtime and allocation-limit checks."""
+        from ._moments_checkpoint import decode
+
+        return decode(cls, data, contract_digest, max_state_bytes)
 
     def _accumulate_leaves(self, rows: np.ndarray, mask: np.ndarray | None) -> None:
         channels = len(self._origin)

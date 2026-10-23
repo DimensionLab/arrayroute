@@ -97,6 +97,43 @@ order before reduction. Do not merge independently accumulated partial streams
 or restore a reduction from its snapshot: a snapshot does not contain the pending
 leaf needed to continue exactly.
 
+For restartable reductions, `checkpoint(contract_digest=...)` returns a canonical
+binary artifact containing the committed moments, first-observation origins,
+pending values and validity mask, and the consumed `rows_seen` cursor. The digest
+must be the lowercase SHA-256 of your saved pipeline contract: include immutable
+input revisions/content hashes, row order, channel selection, units/transforms,
+mask rules and the pinned numerical environment. A path or random run ID is not
+an input identity. The reducer checks the supplied digest; it does not independently
+inspect your sources or construct that contract for you.
+
+```python
+checkpoint_bytes = moments.checkpoint(contract_digest=pipeline_digest)
+# Atomically publish checkpoint_bytes to durable storage before acknowledging progress.
+# After interruption, load only the last committed object, not a temporary upload.
+moments = CanonicalChannelMoments.from_checkpoint(
+    checkpoint_bytes, contract_digest=pipeline_digest,
+)
+next_row = moments.rows_seen  # includes masked rows; excludes unsubmitted prefetch
+# Resume the same transformed stream at next_row, using any convenient read size.
+```
+
+Restoration checks the format, complete-artifact SHA-256, algorithm, contract,
+NumPy/Python versions, OS, machine architecture, byte order, dimensions and state
+invariants before returning independent writable arrays. The basic runtime fields
+are early mismatch checks, not a full environment fingerprint: pin library builds,
+kernel dispatch and relevant settings in your contract. Different machines are
+not automatically certified as bitwise equivalent. There is no bypass flag for a
+contract/runtime mismatch. The default `max_state_bytes=64 << 20` bounds input
+length and persistent accumulator storage independently; increase it explicitly
+for unusually wide channel vectors. It is not a total-process memory limit.
+
+The format stores little-endian integer/float arrays and canonical JSON, never
+pickle or executable objects. It excludes unused buffer capacity and timestamps;
+equal state under the same contract/runtime has equal checkpoint bytes. SHA-256
+detects accidental corruption; authenticate storage separately if writers are
+untrusted. The caller owns atomic storage publication, source verification and
+cursor-based stream replay. This API does not checkpoint a whole training job.
+
 Measure a real local time-first, channel-last Zarr v3 array with
 `python -m arrayroute.benchmark_statistics --store /path/to/array.zarr --output results.json`.
 The benchmark hashes every input pass, checks exact canonical replay across read
