@@ -1038,6 +1038,37 @@ cannot be forcibly cancelled by this API; hard deadlines require process isolati
 The existing `ordered_map` convenience function uses a fresh pool for one pass and
 releases it on exit. Neither API depends on a machine-learning framework or cloud.
 
+For uneven work sizes, also constrain the planned bytes held by submitted tasks,
+completed results and the currently yielded result:
+
+```python
+with OrderedPool(make_processor, workers=4, max_pending=8,
+                 max_pending_bytes=128 << 20,
+                 estimate_bytes=lambda request: request.peak_buffer_bytes) as pool:
+    with pool.map(requests) as results:
+        for result in results:
+            consume(result)
+            del result
+```
+
+The estimator runs once per input before submission. It must return a nonnegative
+integer and account for every buffer covered by the claimed allowance. A task larger
+than the allowance fails before execution; reduce its selection or batch size, or
+increase the allowance. Tasks wait in input order instead of bypassing a large task.
+Admission remains charged while a result is yielded and releases when iteration resumes.
+Estimation and input-iteration errors abort the pass immediately; worker failures still
+surface at their input position.
+
+One input awaiting admission may be retained as lookahead. The input iterable,
+worker caches, unaccounted scratch, allocator overhead and consumer-retained values
+are outside this planned-byte allowance. Use lightweight selection descriptors as
+inputs when bounding actual data-buffer lifetime. This is not a process RSS limit.
+
+`python -m arrayroute.benchmark_admission --output admission.json` compares count-only
+and byte admission in fresh processes with uneven synthetic buffers, verified output
+hashes, traced allocations and peak RSS. It measures queue memory, not scientific
+I/O or training throughput.
+
 ## Measure reader concurrency on your own data
 
 `arrayroute.probe.probe_reads` runs bounded pilots through any `ArrayReader` factory:
