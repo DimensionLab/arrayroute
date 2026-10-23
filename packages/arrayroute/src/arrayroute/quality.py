@@ -43,15 +43,24 @@ def assess_error(
     if reference.dtype.kind != "f" or reference.dtype.itemsize > 8:
         raise TypeError("Reconstruction assessment requires float16, float32 or float64")
     expected_finite, actual_finite = np.isfinite(reference), np.isfinite(reconstructed)
-    comparable = expected_finite & actual_finite
-    matching_special = (
-        (np.isnan(reference) & np.isnan(reconstructed))
-        | (np.isposinf(reference) & np.isposinf(reconstructed))
-        | (np.isneginf(reference) & np.isneginf(reconstructed))
-    )
-    mismatch = int(np.count_nonzero(~(comparable | matching_special)))
-    original = reference[comparable].astype(np.float64)
-    actual = reconstructed[comparable].astype(np.float64)
+    if expected_finite.all() and actual_finite.all():
+        # Match boolean indexing's C-order reduction without copying through a
+        # source-dtype gather. Float64 C-contiguous inputs can be used directly.
+        original = np.asarray(reference, dtype=np.float64, order="C").reshape(-1)
+        actual = np.asarray(reconstructed, dtype=np.float64, order="C").reshape(-1)
+        count, mismatch = reference.size, 0
+    else:
+        comparable = expected_finite & actual_finite
+        matching_special = (
+            (np.isnan(reference) & np.isnan(reconstructed))
+            | (np.isposinf(reference) & np.isposinf(reconstructed))
+            | (np.isneginf(reference) & np.isneginf(reconstructed))
+        )
+        mismatch = int(np.count_nonzero(~(comparable | matching_special)))
+        original = reference[comparable].astype(np.float64)
+        actual = reconstructed[comparable].astype(np.float64)
+        count = int(comparable.sum())
+    del expected_finite, actual_finite
     with np.errstate(over="ignore", invalid="ignore"):
         difference = np.abs(actual - original)
     if not np.all(np.isfinite(difference)):
@@ -66,7 +75,7 @@ def assess_error(
         rmse,
         reference_rmse,
         _relative(rmse, reference_rmse),
-        int(comparable.sum()),
+        count,
         mismatch,
     )
 

@@ -73,3 +73,31 @@ def test_streaming_and_distributed_error_reduction_matches_whole_array():
     assert not merged.passed
     with pytest.raises(ValueError, match="different tolerances"):
         left.merge(ErrorAccumulator(absolute_tolerance=1).result)
+
+
+@pytest.mark.parametrize("dtype", [np.float16, np.float32, np.float64, ">f4", ">f8"])
+@pytest.mark.parametrize("layout", ["c", "fortran", "strided", "reversed", "scalar"])
+def test_finite_path_matches_explicit_comparable_selection(dtype, layout):
+    source = np.random.default_rng(172).normal(size=(13, 7)).astype(dtype)
+    actual = (source.astype(np.float64) * 1.1).astype(dtype)
+    if layout == "fortran":
+        source, actual = np.asfortranarray(source), np.asfortranarray(actual)
+    elif layout == "strided":
+        source, actual = source[::2, ::2], actual[::2, ::2]
+    elif layout == "reversed":
+        source, actual = source[::-1, ::-1], actual[::-1, ::-1]
+    elif layout == "scalar":
+        source, actual = source[0, 0:1].reshape(()), actual[0, 0:1].reshape(())
+    before = source.tobytes(), actual.tobytes()
+    source.setflags(write=False)
+    actual.setflags(write=False)
+    result = assess_error(source, actual, absolute_tolerance=0.2)
+    # A matching NaN forces exceptional-value handling without adding a finite
+    # reduction term. Its finite selection must equal the fast path bit for bit.
+    expected = assess_error(
+        np.append(source.reshape(-1), np.nan).astype(dtype),
+        np.append(actual.reshape(-1), np.nan).astype(dtype),
+        absolute_tolerance=0.2,
+    )
+    assert result == expected
+    assert (source.tobytes(), actual.tobytes()) == before
