@@ -95,7 +95,9 @@ class ZarristaBackend:
         self.dtype = np.dtype(array.metadata["data_type"])
         chunks = array.effective_subchunk_shape or array.chunk_shape([0] * array.ndim)
         codecs = array.metadata["codecs"]
-        outer_codec = len(codecs) != 1 and any(c["name"] == "sharding_indexed" for c in codecs)
+        outer_codec = len(codecs) != 1 and any(
+            (c if isinstance(c, str) else c["name"]) == "sharding_indexed" for c in codecs
+        )
         self._partial_shards = array.is_sharded and not outer_codec
         if outer_codec:
             # A codec outside the shard requires decoding the complete shard.

@@ -76,3 +76,17 @@ def test_session_row_batches_reuse_handles_and_preserve_order(tmp_path, engine, 
     with pytest.raises(InterruptedError):
         session.read_rows(tmp_path, "a", indices, cancelled=lambda: True)
     assert budget.snapshot()["used_bytes"] == 0
+
+
+@pytest.mark.parametrize('engine', ['zarr-python', 'tensorstore', 'zarrista'])
+def test_boolean_masks_with_parameterless_codec_metadata(tmp_path, engine):
+    root = zarr.open_group(tmp_path, mode='w')
+    values = (np.arange(9 * 7).reshape(9, 7) % 3) == 0
+    root.create_array('mask', data=values, chunks=(3, 4))
+    session = LocalReadSession(engine, tensorstore_threads=2)
+    selection = (slice(1, 8, 2), slice(2, 6))
+    result = session.read(tmp_path, 'mask', selection)
+    assert result.dtype == values.dtype
+    assert result.tobytes() == values[selection].tobytes()
+    gathered = session.read_rows(tmp_path, 'mask', [7, 1, 7, -1])
+    assert gathered.tobytes() == values[[7, 1, 7, -1]].tobytes()
