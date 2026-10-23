@@ -1494,3 +1494,29 @@ and hardware. It does not account for chunk reuse, decoding, copying or cache
 effects, and it need not choose the fastest path. Persist the threshold alongside
 the data revision and execution settings; do not change it from live timings when
 reproducing a run.
+
+## Measure reader and worker memory
+
+Install `arrayroute[profiling]` to sample a process tree without a framework dependency:
+
+```python
+from arrayroute.memory import ProcessTreeMemory
+
+with ProcessTreeMemory(interval_s=0.02) as memory:
+    consume_training_batches()
+print(memory.report())
+```
+
+Run this in a separate pass from throughput measurement. The report includes baseline
+and peak sampled RSS sums in bytes, the maximum observed process count, sample count,
+elapsed seconds, and denied or vanished process observations. The default root is
+the current process; `pid=` selects another accessible process. Context exit joins
+the sampling thread, including when the consumer raises. An unexpected observation
+failure is reported rather than silently returning a valid-looking measurement.
+
+RSS sums can count shared pages multiple times. Descendants are discovered on every
+sample; brief processes and peaks between samples may be missed, and process reads
+are sequential rather than atomic. These figures are not unique physical memory,
+GPU memory, a reservation, or an enforced RAM limit. Use fresh processes when
+comparing allocators and caches, and retain the sample interval and access failures
+with the result. Measurement state stays bounded regardless of the number of samples.
