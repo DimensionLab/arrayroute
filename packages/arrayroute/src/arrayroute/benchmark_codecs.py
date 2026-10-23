@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Lossless codec experiments; synthetic arrays, synchronized clocks, exact verification."""
+"""Lossless codec experiments on synthetic or supplied arrays with exact verification."""
 
 from __future__ import annotations
 
@@ -91,8 +91,45 @@ def timed(operation, synchronize=lambda: None):
     return result, time.perf_counter() - started
 
 
-def measure(name: str, pattern: str, side: int, repeats: int, threads: int) -> dict:
-    source = fixture(pattern, side)
+def load_input(path: Path, *, max_bytes: int) -> np.ndarray:
+    """Map a numeric NPY without pickle and reject oversized input before copying."""
+    if max_bytes < 1:
+        raise ValueError("Input byte allowance must be positive")
+    value = np.load(path, mmap_mode="r", allow_pickle=False)
+    if not isinstance(value, np.ndarray):
+        value.close()
+        raise ValueError("Input must be one numeric NPY array, not an archive")
+    if value.dtype.kind not in "biuf" or value.size == 0 or value.ndim == 0:
+        raise ValueError("Input must be a nonempty real numeric array with at least one axis")
+    if value.nbytes > max_bytes:
+        raise MemoryError(f"Input needs {value.nbytes} bytes; allowance is {max_bytes}")
+    return np.ascontiguousarray(value)
+
+
+def measure(
+    name: str,
+    pattern: str,
+    side: int,
+    repeats: int,
+    threads: int,
+    *,
+    input_path: Path | None = None,
+    max_input_bytes: int = 256 << 20,
+    axis_order: tuple[int, ...] | None = None,
+) -> dict:
+    source = (
+        fixture(pattern, side)
+        if input_path is None
+        else load_input(input_path, max_bytes=max_input_bytes)
+    )
+    source_hash = digest(source)
+    axes = tuple(range(source.ndim)) if axis_order is None else axis_order
+    if any(type(axis) is not int for axis in axes) or sorted(axes) != list(range(source.ndim)):
+        raise ValueError("axis_order must be a permutation of all input axes")
+    if name in GPU_CODECS and axes != tuple(range(source.ndim)):
+        raise ValueError("Axis permutation is currently measured only for CPU codecs")
+    inverse = tuple(axes.index(axis) for axis in range(source.ndim))
+    packed_shape = tuple(source.shape[axis] for axis in axes)
     records = []
     versions = {"numpy": np.__version__}
     hardware = {}
@@ -100,9 +137,18 @@ def measure(name: str, pattern: str, side: int, repeats: int, threads: int) -> d
         codec = cpu_codec(name, threads)
         versions["numcodecs"] = importlib.metadata.version("numcodecs")
         options = codec.get_config()
+
+        def encode():
+            packed = np.ascontiguousarray(source.transpose(axes))
+            return codec.encode(packed)
+
+        def decode(encoded):
+            packed = np.frombuffer(codec.decode(encoded), dtype=source.dtype).reshape(packed_shape)
+            return np.ascontiguousarray(packed.transpose(inverse))
+
         for iteration in range(repeats + 1):
-            encoded, encode_s = timed(lambda: codec.encode(source))
-            restored, decode_s = timed(lambda encoded=encoded: codec.decode(encoded))
+            encoded, encode_s = timed(encode)
+            restored, decode_s = timed(lambda encoded=encoded: decode(encoded))
             verify(source, restored)
             if iteration:
                 records.append(
@@ -186,15 +232,20 @@ def measure(name: str, pattern: str, side: int, repeats: int, threads: int) -> d
                 )
     else:
         raise ValueError(name)
+    if digest(source) != source_hash:
+        raise ValueError("Source bytes changed during codec measurement")
     rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     return {
         "codec": name,
-        "pattern": pattern,
-        "side": side,
+        "pattern": pattern if input_path is None else "input",
+        "side": side if input_path is None else None,
         "shape": source.shape,
         "dtype": source.dtype.str,
         "source_bytes": source.nbytes,
-        "source_sha256": digest(source),
+        "source_sha256": source_hash,
+        "axis_order": axes,
+        "packed_shape": packed_shape,
+        "layout_timing": "CPU encode/decode include packing and inverse packing to C order",
         "byte_identical": True,
         "verified_roundtrips": (repeats + 1) * (2 if name in GPU_CODECS else 1),
         "options": options,
@@ -209,30 +260,72 @@ def measure(name: str, pattern: str, side: int, repeats: int, threads: int) -> d
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--input", type=Path, help="Immutable numeric NPY input instead of fixtures"
+    )
+    parser.add_argument(
+        "--max-input-mib",
+        type=int,
+        default=256,
+        help="Maximum decoded input MiB; codec scratch/output are additional",
+    )
+    parser.add_argument(
+        "--axis-order",
+        type=int,
+        nargs="+",
+        help="CPU-only lossless axis permutation; both rearrangements are timed",
+    )
     parser.add_argument("--side", type=int, default=128)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--process-repeats", type=int, default=3)
     parser.add_argument("--threads", type=int, default=4)
-    parser.add_argument("--patterns", nargs="+", choices=PATTERNS, default=list(PATTERNS))
+    parser.add_argument("--patterns", nargs="+", choices=PATTERNS)
     parser.add_argument(
         "--codecs", nargs="+", choices=CPU_CODECS + GPU_CODECS, default=list(CPU_CODECS)
     )
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.input is not None and args.patterns is not None:
+        parser.error("Choose --input or --patterns")
+    args.patterns = args.patterns or list(PATTERNS)
+    if args.max_input_mib < 1:
+        parser.error("--max-input-mib must be positive")
     if args.side < 2 or min(args.repeats, args.process_repeats, args.threads) < 1:
         parser.error("side must be >= 2; counts must be positive")
     if args.worker:
         print(
             json.dumps(
-                measure(args.codecs[0], args.patterns[0], args.side, args.repeats, args.threads)
+                measure(
+                    args.codecs[0],
+                    args.patterns[0],
+                    args.side,
+                    args.repeats,
+                    args.threads,
+                    input_path=args.input,
+                    max_input_bytes=args.max_input_mib << 20,
+                    axis_order=tuple(args.axis_order) if args.axis_order is not None else None,
+                )
             )
         )
         return
     if args.output is None:
         parser.error("--output is required")
+    expected_input = None
+    if args.input is not None:
+        source = load_input(args.input, max_bytes=args.max_input_mib << 20)
+        expected_input = {
+            "source_sha256": digest(source),
+            "shape": list(source.shape),
+            "dtype": source.dtype.str,
+        }
+        del source
     args.output.mkdir(parents=True, exist_ok=False)
     runs, failures = [], []
-    jobs = [(pattern, codec) for pattern in args.patterns for codec in args.codecs]
+    jobs = [
+        (pattern, codec)
+        for pattern in (["input"] if args.input else args.patterns)
+        for codec in args.codecs
+    ]
     source_hash = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     for repeat in range(args.process_repeats):
         for pattern, name in jobs if repeat % 2 == 0 else list(reversed(jobs)):
@@ -244,8 +337,21 @@ def main() -> None:
                     "--worker",
                     "--codecs",
                     name,
-                    "--patterns",
-                    pattern,
+                    *(
+                        ["--axis-order", *map(str, args.axis_order)]
+                        if args.axis_order is not None
+                        else []
+                    ),
+                    *(
+                        [
+                            "--input",
+                            str(args.input.resolve()),
+                            "--max-input-mib",
+                            str(args.max_input_mib),
+                        ]
+                        if args.input
+                        else ["--patterns", pattern]
+                    ),
                     "--side",
                     str(args.side),
                     "--repeats",
@@ -277,17 +383,37 @@ def main() -> None:
                 print(f"FAILED {stem}", flush=True)
                 continue
             result = {"process_repeat": repeat, **json.loads(output.stdout)}
+            if expected_input is not None and any(
+                result[key] != value for key, value in expected_input.items()
+            ):
+                failures.append(
+                    {
+                        "process_repeat": repeat,
+                        "codec": name,
+                        "error": "Input changed between codec processes",
+                    }
+                )
+                continue
             (args.output / f"{stem}.json").write_text(json.dumps(result, indent=2) + "\n")
             runs.append(result)
             print(f"Verified {stem}", flush=True)
     report = {
-        "method": "Synthetic lossless codec benchmark, not solver output. Each codec/pattern uses "
+        "method": (
+            "Supplied immutable NPY input. "
+            if args.input
+            else "Synthetic lossless codec benchmark, not solver output. "
+        )
+        + "Each codec/pattern uses "
         "a fresh process per process-repeat, one untimed warm-up, then repeated warm timings. "
         "Hash and byte comparisons are outside clocks. Device clocks synchronize before/after "
         "encode/decode and exclude host transfers; host clocks include transfers, allocations "
         "and encode or decode. No disk/network I/O is timed. Encoded sizes include codec headers. "
+        "CPU timings include any requested axis packing and inverse packing to C order. "
         "RSS includes fixture creation, imports and verification. No peak GPU-memory claim.",
         "benchmark_sha256": source_hash,
+        "input_identity": expected_input,
+        "axis_order": args.axis_order,
+        "input_limit_bytes": args.max_input_mib << 20 if args.input else None,
         "python": sys.version,
         "platform": platform.platform(),
         "runs": runs,

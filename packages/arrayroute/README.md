@@ -436,6 +436,26 @@ codec experiments without disk/network timing; random bits are an incompressibil
 control. Analytic fields are not simulated CFD. CUDA dependencies are optional and
 subject to their upstream platform and licensing requirements.
 
+To compare codecs on a real field, supply an immutable numeric `.npy` file:
+
+```sh
+python -m arrayroute.benchmark_codecs --input velocity.npy \
+  --max-input-mib 256 --output /tmp/field-codecs
+# For a T,Z,Y,X,C array, test grouping channels without changing their precision:
+python -m arrayroute.benchmark_codecs --input velocity.npy \
+  --axis-order 4 0 1 2 3 --output /tmp/channel-major-codecs
+```
+
+The input is mapped without pickle. Size is checked before making a contiguous copy;
+encoded buffers, decoded copies and native scratch need additional memory. Shape,
+dtype and the logical C-order byte hash are checked across independent processes.
+NaN payloads, signed zeros and endianness are preserved. Input acquisition and any
+initial Fortran-to-C conversion are outside the timers. CPU axis-permutation timings
+include packing before compression and restoring the original C-order shape after
+decompression. GPU permutation is not implemented and is rejected. No reduced-precision
+conversion is applied. Source mutation causes failure; keep the source immutable during
+the experiment. Compression ratios on analytic fixtures do not predict real-field ratios.
+
 ## Export a selection larger than RAM
 
 ```python

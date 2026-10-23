@@ -27,7 +27,7 @@ src = ["packages/*/src"]
 select = ["E", "F", "I", "B", "UP", "N", "W"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["arrayroute", "frontier", "frontier_agent", "frontier_connectors", "frontier_data", "frontier_deploy", "frontier_eval", "frontier_examples", "frontier_explain", "frontier_hub", "frontier_physicsnemo", "frontier_planner", "frontier_plugins", "frontier_prep", "frontier_train"]
+known-first-party = ["arrayroute", "frontier", "frontier_agent", "frontier_connectors", "frontier_data", "frontier_deploy", "frontier_eval", "frontier_examples", "frontier_explain", "frontier_hub", "frontier_physicsnemo", "frontier_planner", "frontier_plugins", "frontier_prep", "frontier_profiler", "frontier_train"]
 
 [tool.pytest.ini_options]
 testpaths = ["packages/arrayroute/"]
