@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Verify bounded lossy blocks independently of the codec that produced them."""
+"""Verify lossless and bounded lossy blocks independently of their codecs."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ import numpy as np
 from .quality import ErrorAssessment, assess_error
 
 Encoder = Callable[[np.ndarray, float], bytes]
+LosslessEncoder = Callable[[np.ndarray], bytes]
 Decoder = Callable[[bytes], np.ndarray]
 MAX_BLOCK_BYTES = 256 << 20
 
@@ -33,6 +34,8 @@ class VerifiedBlock:
 
     Hashes detect changed bytes; they do not authenticate an untrusted receipt.
     Codec identity/version and source provenance belong in that artifact store.
+    Lossless receipts have zero tolerance, no numerical attempts, and identical
+    source/reconstruction hashes, including NaN payloads and signed zeros.
     """
 
     payload: bytes
@@ -73,6 +76,59 @@ def _array_sha(values: np.ndarray) -> str:
 def _check_layout(values: np.ndarray, shape: tuple[int, ...], dtype: str) -> None:
     if not isinstance(values, np.ndarray) or values.shape != shape or values.dtype.str != dtype:
         raise CodecVerificationError("Codec changed the source shape or dtype")
+
+
+def encode_lossless_verified(
+    source: np.ndarray,
+    *,
+    encoder: LosslessEncoder,
+    decoder: Decoder,
+    unit: str,
+    max_block_bytes: int = MAX_BLOCK_BYTES,
+) -> VerifiedBlock:
+    """Verify exact numerical-array bytes without floating-point assessment.
+
+    Both round trips must reproduce the source's C-order bytes and identical
+    compressed payloads. No finite-value scan, float64 conversion or numerical
+    reduction is needed. Boolean, integer, float and complex arrays are supported;
+    object and structured arrays are excluded. Byte order is preserved.
+
+    Callbacks receive an immutable snapshot, never the caller's array. As with
+    ``encode_verified``, native callbacks are trusted and the block limit does not
+    constrain their internal allocations. Repetition proves this invocation's
+    repeatability; retained hashes check later reads, not future codec versions.
+    """
+    if type(max_block_bytes) is not int or not 1 <= max_block_bytes <= MAX_BLOCK_BYTES:
+        raise ValueError("max_block_bytes must be an integer between 1 and 256 MiB")
+    if not isinstance(source, np.ndarray) or source.dtype.kind not in "biufc":
+        raise TypeError("Source must be a boolean, integer, float or complex array")
+    if not source.size or source.nbytes > max_block_bytes:
+        raise ValueError("Source must be nonempty and fit the block byte limit")
+    if not isinstance(unit, str) or not unit.strip():
+        raise ValueError("Supply the physical unit, or '1' for dimensionless data")
+    snapshot = source.tobytes(order="C")
+    shape, dtype = source.shape, source.dtype.str
+    source_hash = _sha(snapshot)
+
+    def round_trip() -> bytes:
+        values = np.frombuffer(snapshot, dtype=dtype).reshape(shape)
+        payload = encoder(values)
+        if _sha(snapshot) != source_hash:
+            raise CodecVerificationError("Codec mutated the source snapshot")
+        if not isinstance(payload, bytes) or not payload:
+            raise CodecVerificationError("Codec must return nonempty bytes")
+        restored = decoder(payload)
+        _check_layout(restored, shape, dtype)
+        if _array_sha(restored) != source_hash:
+            raise CodecVerificationError("Lossless codec changed source bytes")
+        return payload
+
+    payload = round_trip()
+    if round_trip() != payload:
+        raise CodecVerificationError("Codec is not byte-repeatable")
+    return VerifiedBlock(
+        payload, shape, dtype, unit.strip(), 0.0, (), source_hash, _sha(payload), source_hash,
+    )
 
 
 def encode_verified(

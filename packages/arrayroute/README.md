@@ -531,6 +531,29 @@ total write time including retries, validation and repeatability checks; native 
 throughput alone is insufficient. Repeated calls here do not prove cross-device
 determinism; a later decode mismatch is reported rather than silently accepted.
 
+For lossless storage, use `encode_lossless_verified` with a single-argument encoder:
+
+```python
+from arrayroute.codec_guard import encode_lossless_verified
+
+verified = encode_lossless_verified(
+    velocity_block,
+    encoder=lossless_codec.compress,
+    decoder=lossless_codec.decompress,
+    unit="m/s",
+)
+restored = verified.decode(lossless_codec.decompress)
+```
+
+This checks exact C-order bytes on both round trips and requires identical compressed
+payloads. It avoids finite-value scans and floating-point error reductions. Boolean,
+integer, floating-point and complex arrays are supported, including non-native byte
+order, NaN payloads, infinities and signed zeros. Object/structured arrays are excluded.
+The receipt has zero tolerance, an empty numerical-attempt list and identical source
+and reconstruction hashes. The same 256 MiB block cap, immutable source snapshot,
+trusted-callback boundary and subsequent-read checks apply. Retain codec identity and
+provenance with the receipt; hashes are integrity checks, not authentication.
+
 ## Spatial grid storage policy
 
 `arrayroute.layout.GridLayoutPolicy` chooses bounded spatial chunks and optional Zarr v3
