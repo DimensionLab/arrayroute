@@ -1468,3 +1468,29 @@ an in-flight native call.
 
 `LocalReadSession.read_rows(store, array_path, indices, ...)` reuses the session’s
 selected engine, open handles and buffer policy for the same operation.
+
+For a batch containing several windows, screen the overlap before deciding to
+read and normalize them together:
+
+```python
+from arrayroute.batching import plan_row_batch
+
+plan = plan_row_batch([[12, 13, 14], [13, 14, 15]], row_count=100,
+                      min_reuse_fraction=0.25)
+assert plan.combine
+assert plan.unique_rows == (12, 13, 14, 15)
+```
+
+The plan uses only requested indices. It normalizes negative indices, retains
+first-occurrence order and stores metadata proportional to the batch, not the
+array size. `combine` requires multiple selections, repeated rows and a reuse
+fraction at least as large as the threshold. A zero threshold still requires
+reuse; one keeps finite batches separate. The caller executes the chosen path
+and preserves its output order and ownership guarantees.
+
+This is a deterministic overlap heuristic, not a calibrated latency model.
+The default 25% threshold is an initial setting to benchmark on the actual layout
+and hardware. It does not account for chunk reuse, decoding, copying or cache
+effects, and it need not choose the fastest path. Persist the threshold alongside
+the data revision and execution settings; do not change it from live timings when
+reproducing a run.
