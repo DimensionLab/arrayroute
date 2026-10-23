@@ -79,8 +79,14 @@ def cpu_codec(name: str, threads: int):
 
 def verify(source: np.ndarray, restored: object) -> None:
     actual = np.frombuffer(restored, dtype=np.uint8)  # type: ignore[arg-type]
-    if not np.array_equal(source.view(np.uint8).reshape(-1), actual):
+    expected = source.view(np.uint8).reshape(-1)
+    if expected.size != actual.size:
         raise ValueError("Lossless reconstruction changed source bytes")
+    # Verification must not allocate a Boolean temporary as large as the input.
+    for offset in range(0, expected.size, 8 << 20):
+        stop = offset + (8 << 20)
+        if not np.array_equal(expected[offset:stop], actual[offset:stop]):
+            raise ValueError("Lossless reconstruction changed source bytes")
 
 
 def timed(operation, synchronize=lambda: None):
@@ -158,6 +164,7 @@ def measure(
                         "encoded_bytes": len(encoded),
                     }
                 )
+            del encoded, restored
     elif name in GPU_CODECS:
         cp = importlib.import_module("cupy")
         nvcomp = importlib.import_module("nvidia.nvcomp")
@@ -230,6 +237,7 @@ def measure(
                         "encoded_bytes": encoded_host.nbytes,
                     }
                 )
+            del encoded_device, restored_device, encoded_host, restored_host
     else:
         raise ValueError(name)
     if digest(source) != source_hash:

@@ -210,3 +210,61 @@ def test_permutation_gpu_not_claimed_or_imported(tmp_path):
     np.save(path, np.ones((2, 3), dtype="f4"))
     with pytest.raises(ValueError, match="only for CPU"):
         measure("gpu-lz4", "unused", 8, 1, 1, input_path=path, axis_order=(1, 0))
+
+
+def test_verification_scratch_is_bounded_and_checks_final_bytes(monkeypatch):
+    from arrayroute.benchmark_codecs import verify
+
+    original = np.array_equal
+    sizes = []
+
+    def bounded(left, right):
+        sizes.append(left.size)
+        return original(left, right)
+
+    monkeypatch.setattr(np, "array_equal", bounded)
+    source = np.arange((17 << 20) + 13, dtype=np.uint8)
+    restored = source.copy()
+    verify(source, restored)
+    assert max(sizes) <= 8 << 20 and sum(sizes) == source.nbytes
+    restored[-1] ^= 1
+    with pytest.raises(ValueError, match="changed source bytes"):
+        verify(source, restored)
+    with pytest.raises(ValueError, match="changed source bytes"):
+        verify(source, restored[:-1])
+
+
+def test_previous_roundtrip_buffers_released_before_next_encode(tmp_path, monkeypatch):
+    import weakref
+
+    import arrayroute.benchmark_codecs as module
+
+    pytest.importorskip("numcodecs")
+
+    class Codec:
+        last_encoded = None
+        last_decoded = None
+        calls = 0
+
+        def get_config(self):
+            return {"id": "test-buffer-lifetime"}
+
+        def encode(self, source):
+            assert self.last_encoded is None or self.last_encoded() is None
+            assert self.last_decoded is None or self.last_decoded() is None
+            output = source.view(np.uint8).reshape(-1).copy()
+            self.last_encoded = weakref.ref(output)
+            self.calls += 1
+            return output
+
+        def decode(self, encoded):
+            output = encoded.copy()
+            self.last_decoded = weakref.ref(output)
+            return output
+
+    codec = Codec()
+    monkeypatch.setattr(module, "cpu_codec", lambda name, threads: codec)
+    source = tmp_path / "field.npy"
+    np.save(source, np.ones((2, 3), dtype="f4"))
+    result = measure("zstd", "unused", 8, 2, 1, input_path=source)
+    assert result["verified_roundtrips"] == codec.calls == 3
