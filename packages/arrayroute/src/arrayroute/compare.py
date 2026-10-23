@@ -129,6 +129,9 @@ def compare_reads(
         'memory_scope': 'Read buffers exclude native caches, codec scratch, encoded inputs '
                         'and up to 64 KiB hash scratch per worker; not a process-RSS bound',
         'deadline_scope': 'Cooperative between reads; in-flight native calls are joined',
+        'read_cost_scope': 'Completed tile plans, counting repeated chunk visits; decoded byte '
+                           'bounds include chunk padding. Not observed disk/network traffic or '
+                           'cache misses; cached backends may decode fewer bytes.',
     }
 
     def expired():
@@ -156,6 +159,10 @@ def compare_reads(
                 'policy': name, 'workers': workers, 'repetition': repetition,
                 'elapsed_seconds': elapsed, 'cpu_seconds': cpu_elapsed, 'verified': True,
                 'output_bytes': sum(r['bytes'] for r in rows),
+                'planned_chunk_visits': sum(r['planned_chunk_visits'] for r in rows),
+                'decoded_bytes_upper_bound': sum(r['decoded_bytes_upper_bound'] for r in rows),
+                'decode_amplification_upper_bound': (
+                    sum(r['decoded_bytes_upper_bound'] for r in rows) / output_bytes),
                 'requests': sum(r['requests'] for r in rows), 'read_strategies': dict(strategies),
                 'gather_workers_peak': max(r['gather_workers_peak'] for r in rows),
             })

@@ -50,6 +50,34 @@ def test_policies_share_reference_and_shuffle_globally_with_different_chunk_layo
                for t in report['trials'])
     assert all(s['min_seconds'] <= s['median_seconds'] <= s['max_seconds']
                for s in report['summary'])
+    for trial in report['trials']:
+        assert trial['planned_chunk_visits'] == (32 if trial['policy'] == 'slow' else 16)
+        assert trial['decoded_bytes_upper_bound'] == 512
+        assert trial['decode_amplification_upper_bound'] == 2
+
+
+def test_executed_cost_counts_repeated_chunks_when_memory_forces_subdivision():
+    class Backend:
+        dtype = np.dtype('f4')
+        spec = ArraySpec((8,), (4,), 4)
+
+        def read(self, selection):
+            return np.arange(8, dtype='f4')[selection]
+
+    def source(budget):
+        return ArrayReader(Backend(), buffer_bytes=budget)
+    report = compare_reads(source, [ReadPolicy('same-array', source)], [(slice(None),)] * 2,
+        worker_counts=[1, 2], total_buffer_bytes=104, max_output_bytes=1024,
+        repeats=1, time_budget_seconds=30)
+    by_workers = {row['workers']: row for row in report['trials']}
+    assert by_workers[1]['output_bytes'] == by_workers[2]['output_bytes'] == 64
+    assert by_workers[1]['planned_chunk_visits'] == 4
+    assert by_workers[1]['decoded_bytes_upper_bound'] == 64
+    assert by_workers[1]['decode_amplification_upper_bound'] == 1
+    assert by_workers[2]['requests'] == 16
+    assert by_workers[2]['planned_chunk_visits'] == 16
+    assert by_workers[2]['decoded_bytes_upper_bound'] == 256
+    assert by_workers[2]['decode_amplification_upper_bound'] == 4
 
 
 def test_payload_cap_is_checked_across_all_policies_before_reading():

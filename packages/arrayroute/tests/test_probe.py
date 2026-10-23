@@ -46,6 +46,8 @@ def test_shuffled_pilot_checks_every_result_and_accounts_all_passes():
     assert len(calls) == 28
     assert all(t['verified'] and t['requests'] == 4 and t['output_bytes'] == 256
                for t in report['trials'])
+    assert all(t['planned_chunk_visits'] == 16 and t['decoded_bytes_upper_bound'] == 256
+               and t['decode_amplification_upper_bound'] == 1 for t in report['trials'])
 
 
 def test_preflight_rejects_payload_cost_before_reading():

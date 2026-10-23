@@ -36,6 +36,7 @@ class ReadStats:
     seconds: float = 0.0
     read_strategies: dict[str, int] = field(default_factory=dict)
     gather_workers_peak: int = 0
+    planned_chunk_visits: int = 0
 
 
 class ArrayReader:
@@ -88,6 +89,7 @@ class ArrayReader:
                     stats.seconds += time.perf_counter() - start
                     stats.output_bytes += value.nbytes
                     stats.decoded_bytes_upper_bound += tile.plan.decoded_bytes_upper_bound
+                    stats.planned_chunk_visits += tile.plan.chunks_touched
                 yield tile, value
                 # Release the previous buffer before returning its reservation.
                 del value

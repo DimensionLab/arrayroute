@@ -1409,6 +1409,15 @@ throughput predictions. Test the selected configuration on held-out regions befo
 using it for a large job. The cooperative deadline joins in-flight reads; incomplete
 pilots retain diagnostics and never recommend a configuration.
 
+Each trial also reports `planned_chunk_visits`, `decoded_bytes_upper_bound` and
+`decode_amplification_upper_bound` from its completed read tiles. These count repeated
+visits when a small memory allowance subdivides a request across the same chunks.
+They explain layout and memory tradeoffs alongside elapsed time: fewer decoded bytes
+can still be slower if many tiny chunks need processing. They are conservative plan
+accounting, including padded chunk edges, not measured disk/network bytes or cache
+misses. An underlying cache can avoid some of that work. `requests` counts reader
+tile calls, not HTTP requests. The same fields are available from `probe_reads`.
+
 ### Choose a cache policy from your own workload
 
 `TraceRecorder` observes exact array selections without saving field values. Wrap

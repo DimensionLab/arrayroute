@@ -107,6 +107,9 @@ def probe_reads(
                         'excludes native caches, codec scratch and up to 64 KiB hash scratch '
                         'per worker',
         'deadline_scope': 'Cooperative between reads; in-flight native reads are joined',
+        'read_cost_scope': 'Completed tile plans, counting repeated chunk visits; decoded byte '
+                           'bounds include chunk padding. Not observed disk/network traffic or '
+                           'cache misses; cached backends may decode fewer bytes.',
     }
 
     def expired() -> bool:
@@ -134,6 +137,10 @@ def probe_reads(
             report['trials'].append({
                 'repetition': repetition, 'workers': count, 'elapsed_seconds': elapsed,
                 'output_bytes': sum(r['bytes'] for r in rows),
+                'planned_chunk_visits': sum(r['planned_chunk_visits'] for r in rows),
+                'decoded_bytes_upper_bound': sum(r['decoded_bytes_upper_bound'] for r in rows),
+                'decode_amplification_upper_bound': (
+                    sum(r['decoded_bytes_upper_bound'] for r in rows) / output_bytes),
                 'read_seconds_sum': sum(r['read_seconds'] for r in rows),
                 'requests': sum(r['requests'] for r in rows), 'verified': True,
                 'read_strategies': dict(strategies),
@@ -174,6 +181,8 @@ def _run_reads(
                 digest.update(cast(np.ndarray, block).tobytes())
             return {'sha256': digest.hexdigest(), 'bytes': value.nbytes,
                     'requests': stats.requests, 'read_seconds': stats.seconds,
+                    'planned_chunk_visits': stats.planned_chunk_visits,
+                    'decoded_bytes_upper_bound': stats.decoded_bytes_upper_bound,
                     'read_strategies': stats.read_strategies,
                     'gather_workers_peak': stats.gather_workers_peak}
 
