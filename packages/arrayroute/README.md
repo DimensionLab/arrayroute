@@ -291,7 +291,7 @@ outside the reader are additional memory. The plan assumes one active value per 
 
 ## Read remote arrays
 
-Install the optional `tensorstore` extra to read immutable Zarr v3 arrays over HTTP or
+Install the optional `tensorstore` extra to read immutable Zarr v2/v3 arrays over HTTP or
 S3-compatible storage:
 
 ```python
@@ -304,6 +304,10 @@ session = RemoteReadSession(
 reader = session.open("case-17/velocity")
 region = reader.read((10, slice(20, 60), slice(30, 70), slice(10, 50), slice(None)))
 ```
+
+The default is Zarr format 3. Set `zarr_format=2` for format 2 archives; the directory
+name or URL suffix does not determine the stored format. Selection, byte budgeting,
+read-only access and worker serialization have the same contract for both formats.
 
 For a private S3-compatible service, supply `endpoint="https://storage.example.org"`
 and its region. Credentials are resolved by TensorStore inside each worker using its

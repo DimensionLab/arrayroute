@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Read-only sessions for immutable Zarr v3 arrays on HTTP and S3-compatible storage."""
+"""Read-only sessions for immutable Zarr arrays on HTTP and S3-compatible storage."""
 
 from __future__ import annotations
 
@@ -124,6 +124,7 @@ class RemoteReadSession:
         cache_bytes: int = 0,
         concurrency: int = 8,
         max_retries: int = 3,
+        zarr_format: Literal[2, 3] = 3,
         tile_cache: TileCache | None = None,
         cache_identity: ArrayIdentity | None = None,
     ):
@@ -144,6 +145,9 @@ class RemoteReadSession:
             raise ValueError(
                 "Positive buffer/handle/concurrency/retry limits and nonnegative cache required"
             )
+        if index(zarr_format) not in {2, 3}:
+            raise ValueError("zarr_format must be 2 or 3")
+        self.zarr_format = zarr_format
         self.store = store
         self.buffer_bytes = buffer_bytes
         self.max_open_arrays = max_open_arrays
@@ -179,7 +183,8 @@ class RemoteReadSession:
                 }
             )
         array = ts.open(
-            {"driver": "zarr3", "kvstore": self.store.spec(path)},
+            {"driver": "zarr" if self.zarr_format == 2 else "zarr3",
+             "kvstore": self.store.spec(path)},
             read=True,
             write=False,
             recheck_cached_data=False,
@@ -188,7 +193,7 @@ class RemoteReadSession:
         backend = TensorStoreBackend(array)
         if self.tile_cache is not None and self.cache_identity is not None:
             identity = replace(self.cache_identity, source=json.dumps(
-                [self.cache_identity.source, self.store.spec(path)],
+                [self.cache_identity.source, self.store.spec(path), self.zarr_format],
                 sort_keys=True, separators=(",", ":")))
             reader = ArrayReader(self.tile_cache.backend(backend, identity),
                                  buffer_bytes=self.buffer_bytes)

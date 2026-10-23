@@ -19,6 +19,8 @@ def object_server(tmp_path):
     root = zarr.open_group(tmp_path, mode="w")
     for name in ("velocity", "pressure"):
         root.create_array(name, data=values, chunks=(1, 16, 16, 16), shards=(1, 64, 64, 64))
+    legacy = zarr.open_group(tmp_path / "v2", mode="w", zarr_format=2)
+    legacy.create_array("velocity", data=values, chunks=(1, 16, 16, 16))
     files = {
         "/data/" + str(p.relative_to(tmp_path)): p.read_bytes()
         for p in tmp_path.rglob("*")
@@ -152,6 +154,29 @@ def test_remote_range_reads_are_exact_and_do_not_download_the_whole_shard(
     with pytest.raises(ValueError, match="NOT_FOUND|not exist|Not found"):
         session.open("missing")
     assert not session._readers
+
+
+@pytest.mark.parametrize("protocol", ["http", "s3"])
+def test_explicit_zarr2_remote_reads_and_serialized_worker(object_server, monkeypatch, protocol):
+    url, values, requests, _ = object_server
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test-access")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test-secret")
+    store = (HttpStore(url + "/data/v2") if protocol == "http" else S3Store(
+        "test-bucket", prefix="data/v2", endpoint=url, region="us-east-1",
+        credentials="environment",
+    ))
+    session = RemoteReadSession(store, zarr_format=2, buffer_bytes=1 << 20)
+    selection = (1, slice(2, 8), slice(5, 13, 2), slice(3, 14))
+    actual = session.read("velocity", selection)
+    assert actual.tobytes() == values[selection].tobytes()
+    assert not session.open("velocity").backend.array.writable
+    clone = pickle.loads(pickle.dumps(session))
+    assert clone.zarr_format == 2 and not clone._readers
+    assert clone.read("velocity", selection).tobytes() == actual.tobytes()
+    assert any(r["key"].endswith(".zarray") for r in requests)
+    assert not any(r["key"].endswith("zarr.json") for r in requests)
+    with pytest.raises(ValueError, match="zarr_format"):
+        RemoteReadSession(store, zarr_format=4)
 
 
 @pytest.mark.parametrize('admission', ['lru', 'retain'])
