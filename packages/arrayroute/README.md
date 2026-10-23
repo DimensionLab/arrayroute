@@ -1558,6 +1558,11 @@ logical selection. Backend chunks may still decode unselected data. Set
 against the actual layout: coalescing is not always faster. This operation changes
 I/O order, not the sampler's output order. It has no persistent data cache.
 
+Contiguous runs use a bounded prefix search to find the largest read fitting the
+allowance, rather than planning every growing prefix. Index bookkeeping remains
+linear in requested rows; long fitting runs need one coalescing-plan probe. This
+reduces planning overhead, not the bytes decoded or the storage latency.
+
 The reader allowance covers the complete returned batch plus planned read buffers.
 A batch that leaves insufficient read space fails; split it into smaller batches.
 Native caches, encoded bytes, codec scratch and Python index metadata remain separate

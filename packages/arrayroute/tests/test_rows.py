@@ -136,3 +136,77 @@ def test_real_tensorstore_zarr_with_partial_chunks(tmp_path, sharded):
     ids = [18, 0, 3, 2, 18, 4]
     actual = read_rows(reader, ids, tail=(1, slice(None), slice(None, None, 2)))
     assert actual.tobytes() == values[ids, 1, :, ::2].tobytes()
+
+
+def test_long_contiguous_batch_does_not_plan_every_growing_prefix(monkeypatch):
+    values = np.arange(8192, dtype='f4')
+    source = Observed(values, (32,))
+    calls = []
+    original = ArrayReader.plan
+
+    def observed(self, selection):
+        calls.append(selection)
+        return original(self, selection)
+
+    monkeypatch.setattr(ArrayReader, 'plan', observed)
+    result = read_rows(ArrayReader(source, buffer_bytes=1 << 20), range(len(values)))
+    assert result.tobytes() == values.tobytes()
+    assert len(source.calls) == 1
+    assert len(calls) < 10
+
+
+@pytest.mark.parametrize('mode', ['native', 'window', 'dense', 'parallel', 'bulk'])
+@pytest.mark.parametrize('tail', [(slice(None),), (slice(1, 12, 3),), (3,)])
+def test_coalescing_prefix_search_matches_exhaustive_budget_boundary(mode, tail):
+    from arrayroute.plan import DecodeWindow, GatherWindow
+    from arrayroute.rows import _fitting_end
+
+    source = Observed(np.zeros((61, 13), dtype='f4'), (4, 4))
+    options = {}
+    if mode != 'native':
+        options['decode_window'] = DecodeWindow(1, strided_only=mode == 'dense')
+    if mode == 'dense':
+        options['dense_gather'] = True
+    if mode in ('parallel', 'bulk'):
+        options['gather_window'] = GatherWindow((8, 8), 4, bulk=mode == 'bulk')
+    source.spec = ArraySpec((61, 13), (4, 4), 4, **options)
+    source.read_plan = lambda request: source.read(request.selection)
+    for begin in (0, 1, 17):
+        rows = list(range(begin, 61))
+        for allowance in (1, 64, 129, 256, 511, 1024, 4096, 10000):
+            reader = ArrayReader(source, buffer_bytes=allowance)
+            fits = [reader.plan((slice(begin, row + 1), *tail)).buffer_bytes_upper_bound
+                    <= allowance for row in rows]
+            assert fits == sorted(fits, reverse=True)
+            expected = max([1, *[i + 1 for i, fit in enumerate(fits) if fit]])
+            assert _fitting_end(reader, rows, 0, len(rows), tail) == expected
+
+
+def test_long_runs_split_at_budget_and_gaps_without_reading_unrequested_rows():
+    values = np.arange(250 * 4, dtype='f4').reshape(250, 4)
+    source = Observed(values, (1, 4))
+    ids = [*range(200, 230), *range(1, 96), 9, 211]
+    output_bytes = len(ids) * 16
+    result = read_rows(ArrayReader(source, buffer_bytes=output_bytes + 128), ids)
+    assert result.tobytes() == values[ids].tobytes()
+    touched = [i for call in source.calls for i in range(call[0].start, call[0].stop)]
+    assert touched == sorted(set(ids))
+    assert all(call[0].stop - call[0].start <= 4 for call in source.calls)
+
+
+def test_single_row_allowance_keeps_planning_linear(monkeypatch):
+    values = np.arange(2048, dtype='f4')
+    source = Observed(values, (1,))
+    calls = 0
+    original = ArrayReader.plan
+
+    def observed(self, selection):
+        nonlocal calls
+        calls += 1
+        return original(self, selection)
+
+    monkeypatch.setattr(ArrayReader, 'plan', observed)
+    result = read_rows(ArrayReader(source, buffer_bytes=values.nbytes + 8), range(len(values)))
+    assert result.tobytes() == values.tobytes()
+    assert len(source.calls) == len(values)
+    assert calls <= 4 * len(values) + 1

@@ -14,6 +14,36 @@ from .plan import Selection
 from .reader import ArrayReader, ReadStats
 
 
+def _fitting_end(
+    reader: ArrayReader, rows: list[int], start: int, stop: int, tail: Selection,
+) -> int:
+    """Largest fitting prefix of a contiguous run; a single row may require tiling."""
+    if stop == start + 1:
+        return stop
+
+    def fits(end: int) -> bool:
+        request = reader.plan((slice(rows[start], rows[end - 1] + 1), *tail))
+        return request.buffer_bytes_upper_bound <= reader.buffer_bytes
+
+    if fits(stop):
+        return stop
+    low, high = start + 1, min(start + 2, stop)
+    # With fixed tail selections, native output and live chunk counts only grow.
+    # Optional gather strategies are selected only when they fit the same allowance.
+    # Bound the search by the fitting prefix, not the remaining run: tiny budgets
+    # must not trigger a logarithmic search over a huge suffix for every row.
+    while high < stop and fits(high):
+        low, high = high, min(start + 2 * (high - start), stop)
+    high -= 1
+    while low < high:
+        middle = (low + high + 1) // 2
+        if fits(middle):
+            low = middle
+        else:
+            high = middle - 1
+    return low
+
+
 def read_rows(
     reader: ArrayReader,
     indices: Sequence[int],
@@ -80,16 +110,17 @@ def read_rows(
         worker = ArrayReader(reader.backend, buffer_bytes=reader.buffer_bytes - output_bytes)
         rows = sorted(destinations)
         position = 0
+        run_end = 0
         while position < len(rows):
             check_cancelled()
             begin = rows[position]
             end_position = position + 1
             if coalesce:
-                while end_position < len(rows) and rows[end_position] == rows[end_position - 1] + 1:
-                    candidate = worker.plan((slice(begin, rows[end_position] + 1), *tail))
-                    if candidate.buffer_bytes_upper_bound > worker.buffer_bytes:
-                        break
-                    end_position += 1
+                if position == run_end:
+                    run_end = end_position
+                    while run_end < len(rows) and rows[run_end] == rows[run_end - 1] + 1:
+                        run_end += 1
+                end_position = _fitting_end(worker, rows, position, run_end, tail)
             values = worker.read((slice(begin, rows[end_position - 1] + 1), *tail), stats=stats)
             check_cancelled()
             for row in rows[position:end_position]:
