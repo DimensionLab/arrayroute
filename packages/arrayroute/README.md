@@ -1641,3 +1641,37 @@ are sequential rather than atomic. These figures are not unique physical memory,
 GPU memory, a reservation, or an enforced RAM limit. Use fresh processes when
 comparing allocators and caches, and retain the sample interval and access failures
 with the result. Measurement state stays bounded regardless of the number of samples.
+
+## Apply recorded channel statistics
+
+`arrayroute.normalization.normalize_channels` applies `(values - mean) / scale` to
+channels-last native float32 arrays. NumPy is the default. Install
+`arrayroute[expressions]` to select the optional NumExpr engine explicitly:
+
+```python
+from arrayroute.normalization import normalize_channels, normalization_backend_info
+
+normalized = normalize_channels(values, recorded_mean, recorded_scale, engine="numexpr")
+print(normalization_backend_info("numexpr"))
+```
+
+Input arrays may be read-only or strided. The result is a separate array unless
+`out=` is supplied. Output must be writable and contiguous, and either the input
+itself (only when caller-owned) or have a disjoint memory extent. Parameters are
+copied before writing, so a mean or scale view cannot be corrupted by an in-place
+operation. Shapes, dtypes and finite positive scales are checked before mutation.
+Invalid observations remain nonfinite for the caller's validity policy to handle.
+
+NumExpr uses moderate optimization and float32 operands, preserving the explicit
+subtraction and division rather than replacing division with a reciprocal. Set
+`NUMEXPR_NUM_THREADS=4` before starting Python to select four threads. The pool is
+shared within a process; separate processes and distributed ranks each have their
+own pool. This function never changes global thread settings. The metadata helper
+reports the actual engine version and current process thread count; it raises if
+an explicitly selected engine is unavailable.
+
+Measure the entire loader with the same CPU allowance before choosing an engine:
+small arrays and a single NumExpr thread may be slower. Byte equality is tested
+against NumPy on validation hosts, not promised across arbitrary hardware,
+compiler and library combinations. Record the software stack with benchmark and
+reproducibility results.
