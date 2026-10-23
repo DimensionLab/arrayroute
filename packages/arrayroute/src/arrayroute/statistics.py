@@ -102,6 +102,16 @@ class CanonicalChannelMoments:
         mask = None if valid is None else valid.reshape(-1, channels)
         first = 0
         while first < len(rows):
+            if self._pending == 0 and len(rows) - first >= self.LEAF_ROWS:
+                # Batch independent leaves, never the order of their final fold.
+                capacity = max(1, min(16, (8 << 20) // (self.LEAF_ROWS * channels * 8)))
+                leaves = min(capacity, (len(rows) - first) // self.LEAF_ROWS)
+                stop = first + leaves * self.LEAF_ROWS
+                self._accumulate_leaves(
+                    rows[first:stop], None if mask is None else mask[first:stop]
+                )
+                first = stop
+                continue
             count = min(len(rows) - first, self.LEAF_ROWS - self._pending)
             target = slice(self._pending, self._pending + count)
             self._values[target] = rows[first : first + count]
@@ -113,6 +123,57 @@ class CanonicalChannelMoments:
                     self._moments, self._values, self._valid, self._origin, self._origin_set
                 )
                 self._pending = 0
+
+    def _accumulate_leaves(self, rows: np.ndarray, mask: np.ndarray | None) -> None:
+        channels = len(self._origin)
+        values = np.asarray(rows, dtype=np.float64, order="C").reshape(
+            -1, self.LEAF_ROWS, channels
+        )
+        if mask is None:
+            self._origin[:] = np.where(self._origin_set, self._origin, values[0, 0])
+            self._origin_set[:] = True
+            x = values - self._origin
+            if not np.isfinite(x).all():
+                raise ValueError("Nonfinite observations inside the validity mask")
+            count = np.full((len(values), channels), self.LEAF_ROWS, dtype=np.int64)
+            origin = x[:, 0, :]
+            shifted = x - origin[:, None, :]
+            mean = origin + shifted.sum(axis=1) / count
+            centred = x - mean[:, None, :]
+        else:
+            valid = np.ascontiguousarray(mask).reshape(values.shape)
+            count = valid.sum(axis=1, dtype=np.int64)
+            active = count.any(axis=1)
+            if not active.any():
+                return
+            if not active.all():
+                values, valid, count = values[active], valid[active], count[active]
+            if (count == self.LEAF_ROWS).all():
+                self._accumulate_leaves(values.reshape(-1, channels), None)
+                return
+            if not self._origin_set.all():
+                flat = valid.reshape(-1, channels)
+                observed = flat.any(axis=0)
+                first = values.reshape(-1, channels)[np.argmax(flat, axis=0), np.arange(channels)]
+                self._origin[:] = np.where(~self._origin_set & observed, first, self._origin)
+                self._origin_set |= observed
+            x = np.where(valid, values, self._origin) - self._origin
+            if not np.isfinite(x).all():
+                raise ValueError("Nonfinite observations inside the validity mask")
+            origin = x[
+                np.arange(len(values))[:, None], np.argmax(valid, axis=1),
+                np.arange(channels)[None, :],
+            ]
+            origin = np.where(count > 0, origin, 0)
+            shifted = np.where(valid, x, origin[:, None, :]) - origin[:, None, :]
+            mean = origin + shifted.sum(axis=1) / np.maximum(count, 1)
+            centred = np.where(valid, x, mean[:, None, :]) - mean[:, None, :]
+        m2 = (centred * centred).sum(axis=1)
+        other = ChannelMoments(channels)
+        for index in range(len(values)):
+            if count[index].any():
+                other.count, other.mean, other.m2 = count[index], mean[index], m2[index]
+                self._moments.merge(other)
 
     @staticmethod
     def _accumulate(

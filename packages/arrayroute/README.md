@@ -81,6 +81,13 @@ leaf buffer is 4096 × channels × 9 bytes, plus the channel accumulators; conve
 and validation of a caller buffer may need additional temporary memory.
 Accumulation stays relative to each channel's first valid observation, avoiding
 loss of small between-leaf differences when physical values have a large offset.
+Complete leaves are processed in batches of at most 16, with an 8 MiB converted
+value-buffer target (one complete leaf is the minimum). Temporary arrays can use
+several multiples of that buffer; this is not an RSS cap. Fully observed input
+uses a mask-free path. Both paths preserve each leaf's arithmetic and its ordered
+fold, so execution batching does not change the numerical algorithm identifier.
+Masked input skips leaves with no observations and shares the fast path when the
+remaining leaves are fully observed.
 
 Save `CanonicalChannelMoments.ALGORITHM`, the ordered immutable input identities,
 NumPy version and numerical execution environment. This contract guarantees read
