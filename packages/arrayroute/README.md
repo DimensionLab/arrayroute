@@ -1406,3 +1406,34 @@ recommendation: serial replay cannot predict publication or single-flight behavi
 Take a snapshot after outstanding reads finish. Saved JSON uses private permissions,
 bounded input size and atomic no-overwrite publication; it contains no executable
 factories. The recorder and analysis require only ArrayRoute's base dependencies.
+
+## Ordered frame batches
+
+For minibatches containing overlapping time windows, `read_rows` preserves the
+requested order and duplicates while avoiding repeated logical row reads:
+
+```python
+from arrayroute import read_rows
+
+# Array axes: time, variable, pressure, latitude, longitude.
+frames = read_rows(reader, [12, 13, 14, 13, 14, 15],
+                   tail=(slice(None), slice(None), slice(None), slice(None)))
+```
+
+Adjacent requested rows can share a read, but unrequested gaps are not added to the
+logical selection. Backend chunks may still decode unselected data. Set
+`coalesce=False` to keep deduplication without merging adjacent rows. Benchmark both
+against the actual layout: coalescing is not always faster. This operation changes
+I/O order, not the sampler's output order. It has no persistent data cache.
+
+The reader allowance covers the complete returned batch plus planned read buffers.
+A batch that leaves insufficient read space fails; split it into smaller batches.
+Native caches, encoded bytes, codec scratch and Python index metadata remain separate
+costs. Sources must be immutable throughout the call. `ReadStats` counts physical
+reads rather than duplicate returned rows. Shared `ReadBudget` admission covers the
+whole operation, and cancellation prevents subsequent reads but cannot interrupt
+an in-flight native call.
+
+
+`LocalReadSession.read_rows(store, array_path, indices, ...)` reuses the session’s
+selected engine, open handles and buffer policy for the same operation.

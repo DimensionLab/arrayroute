@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 from collections import OrderedDict
+from collections.abc import Callable, Sequence
 from operator import index
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,7 @@ from .gather import ParallelGatherBackend
 from .plan import GatherWindow, Selection
 from .ranges import RangePolicy
 from .reader import ArrayReader, Backend, ReadStats
+from .rows import read_rows
 
 
 class LocalReadSession:
@@ -185,6 +187,27 @@ class LocalReadSession:
         stats: ReadStats | None = None,
     ):
         return self.open(store, array_path).read(selection, stats=stats)
+
+    def read_rows(
+        self,
+        store: str | Path,
+        array_path: str,
+        indices: Sequence[int],
+        *,
+        tail: Selection | None = None,
+        coalesce: bool = True,
+        stats: ReadStats | None = None,
+        cancelled: Callable[[], bool] | None = None,
+    ):
+        """Read an ordered row batch using this session's handles and buffer policy.
+
+        Source values must remain fixed throughout the call. See ``rows.read_rows``
+        for duplicate handling, cancellation and memory accounting.
+        """
+        return read_rows(
+            self.open(store, array_path), indices, tail=tail, coalesce=coalesce,
+            stats=stats, cancelled=cancelled,
+        )
 
 
 class TensorStoreReadGroup:

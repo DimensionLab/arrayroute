@@ -50,3 +50,29 @@ def test_session_shares_native_context_and_does_not_silently_change_engine(tmp_p
         LocalReadSession(max_open_arrays=1.5)
     with pytest.raises((FileNotFoundError, KeyError, ValueError)):
         session.open(tmp_path, "absent")
+
+
+@pytest.mark.parametrize("engine", ["zarr-python", "tensorstore", "zarrista"])
+@pytest.mark.parametrize("coalesce", [False, True])
+def test_session_row_batches_reuse_handles_and_preserve_order(tmp_path, engine, coalesce):
+    from arrayroute import ReadStats
+    from arrayroute.budget import ReadBudget
+
+    values = np.arange(12 * 6 * 3, dtype=np.float32).reshape(12, 6, 3)
+    root = zarr.open_group(tmp_path, mode="w")
+    root.create_array("a", data=values, chunks=(2, 3, 3))
+    budget = ReadBudget(1 << 20)
+    session = LocalReadSession(engine, buffer_bytes=1 << 20, read_budget=budget)
+    handle = session.open(tmp_path, "a")
+    indices = [8, 2, 3, 2, -1, 4]
+    stats = ReadStats()
+    result = session.read_rows(
+        tmp_path, "a", indices, tail=(slice(1, 6, 2), 1), coalesce=coalesce, stats=stats,
+    )
+    assert result.tobytes() == values[indices, 1:6:2, 1].tobytes()
+    assert session.open(tmp_path, "a") is handle
+    assert stats.requests > 0
+    assert budget.snapshot()["used_bytes"] == 0
+    with pytest.raises(InterruptedError):
+        session.read_rows(tmp_path, "a", indices, cancelled=lambda: True)
+    assert budget.snapshot()["used_bytes"] == 0
