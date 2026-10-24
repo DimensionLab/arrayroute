@@ -25,16 +25,18 @@ class Observed:
 
 
 @pytest.mark.parametrize("dtype", ["<f4", ">f4", "<f8", "i2"])
+@pytest.mark.parametrize("amplification", [1.0, 2.0])
 @pytest.mark.parametrize("selection", [None, (2, slice(1, 9, 2), slice(None)),
                                        (slice(0, 7, 3), 4, slice(2, 11, 3))])
-def test_bit_identity_with_reordered_duplicates_and_selected_views(dtype, selection):
+def test_bit_identity_with_reordered_duplicates_and_selected_views(dtype, selection, amplification):
     rng = np.random.default_rng(19)
     values = np.frombuffer(rng.bytes(7 * 9 * 11 * np.dtype(dtype).itemsize), dtype=dtype)
     values = values.reshape(7, 9, 11)
     view = values if selection is None else values[selection]
     ids = [0, -1, 2, 0, -3, 5]
     backend = Observed(values, (2, 3, 4))
-    actual = take_flat(ArrayReader(backend, buffer_bytes=4096), ids, selection=selection)
+    actual = take_flat(ArrayReader(backend, buffer_bytes=4096), ids, selection=selection,
+                       max_chunk_amplification=amplification)
     assert actual.tobytes() == view.reshape(-1)[ids].tobytes()
     assert actual.dtype == values.dtype
 
@@ -66,6 +68,55 @@ def test_coalescing_preserves_bits_without_reading_unoccupied_chunks():
     ids = [0, 36]
     np.testing.assert_array_equal(take_flat(ArrayReader(backend), ids), values.ravel()[ids])
     assert len(backend.calls) == 2
+
+
+@pytest.mark.parametrize("factor", [1.0, 1.5, 2.0])
+@pytest.mark.parametrize("budget", [4096, 65536])
+def test_grouped_reads_bound_decode_amplification_and_memory(factor, budget):
+    rng = np.random.default_rng(111)
+    values = rng.normal(size=(19, 27, 23)).astype("float32")
+    backend = Observed(values, (4, 5, 6))
+    ids = rng.choice(values.size, 93, replace=False)
+    reader = ArrayReader(backend, buffer_bytes=budget)
+    stats = ReadStats()
+    result = take_flat(reader, ids, stats=stats, max_chunk_amplification=factor)
+    assert result.tobytes() == values.ravel()[ids].tobytes()
+    coordinates = np.array(np.unravel_index(ids, values.shape)).T
+    occupied = len(np.unique(coordinates // np.array(backend.spec.chunks), axis=0))
+    assert stats.planned_chunk_visits <= factor * occupied
+    for call in backend.calls:
+        assert reader.plan(call).buffer_bytes_upper_bound + 2 * result.nbytes <= budget
+
+
+def test_tight_budget_coalesces_subregions_instead_of_individual_chunks():
+    values = np.arange(32 * 32, dtype="float32").reshape(32, 32)
+    backend = Observed(values, (4, 4))
+    ids = np.array([i * 32 + j for i in range(0, 32, 4) for j in range(0, 32, 4)])
+    result = take_flat(ArrayReader(backend, buffer_bytes=2048), ids)
+    assert result.tobytes() == values.ravel()[ids].tobytes()
+    assert 1 < len(backend.calls) < 64
+
+
+@pytest.mark.parametrize("factor", [0, 0.9, True, float("inf"), float("nan")])
+def test_invalid_amplification_fails_before_read(factor):
+    backend = Observed(np.arange(16), (4,))
+    with pytest.raises(ValueError, match="amplification"):
+        take_flat(ArrayReader(backend), [0], max_chunk_amplification=factor)
+    assert backend.calls == []
+
+
+def test_logical_shapes_larger_than_numpy_index_space_remain_addressable():
+    class Procedural:
+        dtype = np.dtype("uint64")
+        spec = ArraySpec((1 << 32, 1 << 32), (1, 1), 8)
+
+        def read(self, selection):
+            rows = np.arange(*selection[0].indices(self.spec.shape[0]), dtype="uint64")
+            cols = np.arange(*selection[1].indices(self.spec.shape[1]), dtype="uint64")
+            return rows[:, None] + cols[None, :]
+
+    result = take_flat(ArrayReader(Procedural(), buffer_bytes=256), [0, (1 << 64) - 1, 0])
+    np.testing.assert_array_equal(result, np.array([0, (1 << 33) - 2, 0], dtype="uint64"))
 
 
 @pytest.mark.parametrize("indices,error", [([True], TypeError), ([np.bool_(0)], TypeError),

@@ -18,19 +18,25 @@ from .reader import ArrayReader, ReadStats
 def take_flat(
     reader: ArrayReader, indices: Sequence[int] | np.ndarray, *, selection: Selection | None = None,
     stats: ReadStats | None = None, cancelled: Callable[[], bool] | None = None,
+    max_chunk_amplification: float = 1.0,
 ) -> np.ndarray:
     """Gather selected logical values, preserving caller order, duplicates and dtype.
 
     Indices address the C-flattened selected view (negative indices count from its end).
     Requests are grouped by physical source chunk. Within a group, bounded rectangles
     may include unrequested values; groups are split until output plus decoded data fit.
-    Empty parts of the selected domain are never traversed. A whole frame is not required.
+    max_chunk_amplification bounds touched chunks relative to occupied chunks in each
+    joined region. The default reads no extra chunks. A whole frame is not required.
 
-    The reader allowance covers the result plus one bounded read. Python index metadata
+    The reader allowance covers the result, one gathered subset and one bounded read.
+    Python index metadata
     is O(number of requested values * rank), additional to this allowance, as are native
     caches and codec scratch. Inputs remain immutable. Shared budgets are reserved once
     for the complete call. Cancellation is checked between groups/reads, not inside I/O.
     """
+    if (isinstance(max_chunk_amplification, bool)
+            or not math.isfinite(max_chunk_amplification) or max_chunk_amplification < 1):
+        raise ValueError("max_chunk_amplification must be finite and at least one")
     if reader.backend.dtype.hasobject:
         raise TypeError("Indexed reads require a fixed-size non-object dtype")
     if isinstance(indices, np.ndarray) and indices.ndim != 1:
@@ -38,7 +44,7 @@ def take_flat(
     source = OrderedSelection.create(reader, selection)
     size = math.prod(source.shape)
     output_bytes = len(indices) * reader.backend.dtype.itemsize
-    if output_bytes >= reader.buffer_bytes:
+    if 2 * output_bytes >= reader.buffer_bytes:
         raise MemoryError("Indexed output leaves no read buffer; split the request")
 
     def check() -> None:
@@ -60,39 +66,64 @@ def take_flat(
     reservation = (reader.shared_budget.reserve(reader.buffer_bytes, cancelled=cancelled)
                    if reader.shared_budget is not None else nullcontext())
     with reservation:
-        worker = ArrayReader(reader.backend, buffer_bytes=reader.buffer_bytes - output_bytes)
-        combined = _coalesced_read(worker, source, normalized, stats, check)
+        worker = ArrayReader(reader.backend, buffer_bytes=reader.buffer_bytes - 2 * output_bytes)
+        combined = _coalesced_read(
+            worker, source, normalized, stats, check, max_chunk_amplification)
         if combined is not None:
             return combined
         return _chunk_reads(worker, source, normalized, stats, check)
 
 
-def _coalesced_read(worker, source, indices, stats, check):
-    # Joining occupied chunks avoids serial I/O without decoding additional chunks.
+def _coalesced_read(worker, source, indices, stats, check, amplification):
     if (not indices or not source.shape
             or math.prod(source.shape) > np.iinfo(np.intp).max
             or max(worker.backend.spec.shape) > np.iinfo(np.intp).max):
         return None
     coordinates = np.unravel_index(np.asarray(indices, dtype=np.intp), source.shape)
-    lower = tuple(int(c.min()) for c in coordinates)
-    upper = tuple(int(c.max()) + 1 for c in coordinates)
-    region = tuple(slice(lo, hi) for lo, hi in zip(lower, upper, strict=True))
-    selected = source.map_region(region)
-    plan = worker.plan(selected)
-    if plan.buffer_bytes_upper_bound > worker.buffer_bytes:
-        return None
     columns = iter(coordinates)
     chunk_columns = []
     for s, chunk in zip(source.selection, worker.backend.spec.chunks, strict=True):
         if not isinstance(s, int):
             chunk_columns.append((s.start + next(columns) * s.step) // chunk)
-    occupied = len(np.unique(np.column_stack(chunk_columns), axis=0))
-    if occupied != plan.chunks_touched:
-        return None
-    check()
-    values = worker.read(selected, stats=stats)
-    check()
-    return values[tuple(c - lo for c, lo in zip(coordinates, lower, strict=True))]
+    chunks = np.column_stack(chunk_columns)
+    output = np.empty(len(indices), dtype=worker.backend.dtype)
+    pending = [np.arange(len(indices), dtype=np.intp)]
+    while pending:
+        check()
+        positions = pending.pop()
+        points = tuple(c[positions] for c in coordinates)
+        lower = tuple(int(c.min()) for c in points)
+        upper = tuple(int(c.max()) + 1 for c in points)
+        region = tuple(slice(lo, hi) for lo, hi in zip(lower, upper, strict=True))
+        selected = source.map_region(region)
+        plan = worker.plan(selected)
+        occupied = np.unique(chunks[positions], axis=0)
+        fits = (plan.buffer_bytes_upper_bound <= worker.buffer_bytes
+                and plan.chunks_touched <= len(occupied) * amplification)
+        if not fits and len(occupied) > 1:
+            # Split only on physical chunk boundaries, so separate branches cannot
+            # decode the same chunk. Sparse empty regions are never enumerated.
+            axis = int(np.argmax(np.ptp(occupied, axis=0)))
+            planes = np.unique(occupied[:, axis])
+            cut = planes[len(planes) // 2]
+            before = chunks[positions, axis] < cut
+            pending.extend((positions[~before], positions[before]))
+            continue
+        if not fits:
+            # Within one chunk, split the output rectangle if it exceeds the allowance.
+            # The decoder's indivisible chunk is still admitted by ArrayReader.
+            if len(positions) > 1:
+                axis = max(range(len(lower)), key=lambda a: upper[a] - lower[a])
+                if upper[axis] - lower[axis] > 1:
+                    order = np.argsort(points[axis], kind="stable")
+                    middle = len(order) // 2
+                    pending.extend((positions[order[middle:]], positions[order[:middle]]))
+                    continue
+        values = worker.read(selected, stats=stats)
+        check()
+        output[positions] = values[tuple(c - lo for c, lo in zip(points, lower, strict=True))]
+        del values
+    return output
 
 
 def _chunk_reads(worker, source, indices, stats, check):

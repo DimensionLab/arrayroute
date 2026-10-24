@@ -48,8 +48,13 @@ from those estimates. A large logical shape is not evidence of large physical I/
 `arrayroute.indexed.take_flat(reader, indices, selection=...)` gathers indices in the
 C-flattened selected view, retaining requested order, duplicates and source dtype bits.
 Negative indices count from the end. It groups requests by physical chunk and joins the
-bounding region when every touched chunk is requested and the result plus read fits the
-reader allowance. Otherwise it subdivides occupied groups without scanning empty regions.
+bounding region when every touched chunk is requested and the result, gathered subset and
+read fit the reader allowance. Otherwise it splits groups at physical chunk boundaries,
+coalescing smaller subregions instead of issuing one request for every chunk.
+`max_chunk_amplification=2.0` explicitly permits joining regions that touch up to twice as
+many chunks as their occupied chunk set; the default is `1.0` (no extra chunks). Splits
+between chunks do not reread them. Subdivision within an indivisible chunk can still require
+repeated decoding; native adapter gather/codec granularity is separate from this policy.
 It does not require an entire spatial frame in memory. One decoded storage chunk must fit.
 Python coordinate metadata uses additional O(requested values × rank) memory; codec scratch
 and backend caches are also outside the payload allowance. Shared read budgets and
