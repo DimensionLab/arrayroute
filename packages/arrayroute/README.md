@@ -1630,13 +1630,13 @@ frames = read_rows(reader, [12, 13, 14, 13, 14, 15],
                    tail=(slice(None), slice(None), slice(None), slice(None)))
 ```
 
-Adjacent requested rows can share a read, but unrequested gaps are not added to the
+Regularly spaced requested rows can share a strided read, but gaps are not added to the
 logical selection. Backend chunks may still decode unselected data. Set
-`coalesce=False` to keep deduplication without merging adjacent rows. Benchmark both
+`coalesce=False` to keep deduplication without merging rows. Benchmark both
 against the actual layout: coalescing is not always faster. This operation changes
 I/O order, not the sampler's output order. It has no persistent data cache.
 
-Contiguous runs use a bounded prefix search to find the largest read fitting the
+Arithmetic runs use a bounded prefix search to find the largest read fitting the
 allowance, rather than planning every growing prefix. Index bookkeeping remains
 linear in requested rows; long fitting runs need one coalescing-plan probe. This
 reduces planning overhead, not the bytes decoded or the storage latency.
@@ -1997,3 +1997,9 @@ The default 32 MiB workspace is admitted per source: fitting requires
 native caches, the outer derived output, parameter metadata and caller-retained results
 are additional. This is not a global RSS cap. Sources are borrowed; nested readers must not
 share the same reservation pool. Cancellation is cooperative between reads and blocks.
+
+For sparse multi-row application over chunked sources, native requests are also capped
+at the smaller of the source allowance and the larger of the transform workspace or
+one selected row's planned read footprint. A large source chunk may therefore exceed
+the transform workspace. This limits concurrent decoding for widely spaced selections;
+it does not limit persistent backend caches or make the workspace a total RSS cap.

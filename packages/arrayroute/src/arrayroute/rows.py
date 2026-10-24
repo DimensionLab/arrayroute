@@ -15,14 +15,14 @@ from .reader import ArrayReader, ReadStats
 
 
 def _fitting_end(
-    reader: ArrayReader, rows: list[int], start: int, stop: int, tail: Selection,
+    reader: ArrayReader, rows: list[int], start: int, stop: int, tail: Selection, stride: int = 1,
 ) -> int:
-    """Largest fitting prefix of a contiguous run; a single row may require tiling."""
+    """Largest fitting prefix of an arithmetic run; one row may require tiling."""
     if stop == start + 1:
         return stop
 
     def fits(end: int) -> bool:
-        request = reader.plan((slice(rows[start], rows[end - 1] + 1), *tail))
+        request = reader.plan((slice(rows[start], rows[end - 1] + 1, stride), *tail))
         return request.buffer_bytes_upper_bound <= reader.buffer_bytes
 
     if fits(stop):
@@ -55,9 +55,9 @@ def read_rows(
 ) -> np.ndarray:
     """Gather leading-axis rows in caller order, including repeated and negative indices.
 
-    Each distinct row is read once. Adjacent requested rows may share a bounded read;
+    Each distinct row is read once. Regularly spaced rows may share a bounded read;
     gaps are never filled with unrequested rows. ``coalesce=False`` keeps deduplication
-    but disables adjacency merging for layouts where it is slower. This does not
+    but disables merging for layouts where it is slower. This does not
     change the sampler or optimizer order. ``tail`` selects the remaining axes.
 
     The reader's allowance covers the complete output plus one read's planned
@@ -111,6 +111,7 @@ def read_rows(
         rows = sorted(destinations)
         position = 0
         run_end = 0
+        stride = 1
         while position < len(rows):
             check_cancelled()
             begin = rows[position]
@@ -118,14 +119,19 @@ def read_rows(
             if coalesce:
                 if position == run_end:
                     run_end = end_position
-                    while run_end < len(rows) and rows[run_end] == rows[run_end - 1] + 1:
+                    if run_end < len(rows):
+                        stride = rows[run_end] - rows[position]
                         run_end += 1
-                end_position = _fitting_end(worker, rows, position, run_end, tail)
-            values = worker.read((slice(begin, rows[end_position - 1] + 1), *tail), stats=stats)
+                        while run_end < len(rows) and rows[run_end] - rows[run_end - 1] == stride:
+                            run_end += 1
+                end_position = _fitting_end(worker, rows, position, run_end, tail, stride)
+            values = worker.read(
+                (slice(begin, rows[end_position - 1] + 1, stride), *tail), stats=stats,
+            )
             check_cancelled()
             for row in rows[position:end_position]:
                 for target in destinations[row]:
-                    output[target] = values[row - begin]
+                    output[target] = values[(row - begin) // stride]
             del values
             position = end_position
         return output

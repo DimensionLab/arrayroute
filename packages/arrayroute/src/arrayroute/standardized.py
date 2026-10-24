@@ -205,7 +205,18 @@ class StandardizedChannelsBackend:
                     self.workspace_bytes // (count * (source.backend.dtype.itemsize + 24)),
                     source.buffer_bytes // (2 * count * source.backend.dtype.itemsize),
                 )
-                ordered = OrderedSelection.create(source, (time, local))
+                worker = source
+                if nrows > 1 and not source.backend.spec.contiguous:
+                    first_row = time if isinstance(time, int) else slice(
+                        time.start, time.start + 1, time.step,
+                    )
+                    minimum = source.plan((first_row, local)).buffer_bytes_upper_bound
+                    worker = ArrayReader(
+                        source.backend,
+                        buffer_bytes=min(source.buffer_bytes, max(self.workspace_bytes, minimum)),
+                        shared_budget=source.shared_budget,
+                    )
+                ordered = OrderedSelection.create(worker, (time, local))
                 for start in range(0, nrows, rows):
                     _cancel(self.cancelled)
                     end = min(nrows, start + rows)

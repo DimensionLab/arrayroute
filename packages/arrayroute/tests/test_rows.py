@@ -157,7 +157,8 @@ def test_long_contiguous_batch_does_not_plan_every_growing_prefix(monkeypatch):
 
 @pytest.mark.parametrize('mode', ['native', 'window', 'dense', 'parallel', 'bulk'])
 @pytest.mark.parametrize('tail', [(slice(None),), (slice(1, 12, 3),), (3,)])
-def test_coalescing_prefix_search_matches_exhaustive_budget_boundary(mode, tail):
+@pytest.mark.parametrize('stride', [1, 3, 7])
+def test_coalescing_prefix_search_matches_exhaustive_budget_boundary(mode, tail, stride):
     from arrayroute.plan import DecodeWindow, GatherWindow
     from arrayroute.rows import _fitting_end
 
@@ -172,14 +173,42 @@ def test_coalescing_prefix_search_matches_exhaustive_budget_boundary(mode, tail)
     source.spec = ArraySpec((61, 13), (4, 4), 4, **options)
     source.read_plan = lambda request: source.read(request.selection)
     for begin in (0, 1, 17):
-        rows = list(range(begin, 61))
+        rows = list(range(begin, 61, stride))
         for allowance in (1, 64, 129, 256, 511, 1024, 4096, 10000):
             reader = ArrayReader(source, buffer_bytes=allowance)
-            fits = [reader.plan((slice(begin, row + 1), *tail)).buffer_bytes_upper_bound
+            fits = [reader.plan((slice(begin, row + 1, stride), *tail)).buffer_bytes_upper_bound
                     <= allowance for row in rows]
             assert fits == sorted(fits, reverse=True)
             expected = max([1, *[i + 1 for i, fit in enumerate(fits) if fit]])
-            assert _fitting_end(reader, rows, 0, len(rows), tail) == expected
+            assert _fitting_end(reader, rows, 0, len(rows), tail, stride) == expected
+
+
+def test_sparse_arithmetic_rows_preserve_order_and_skip_unrequested_payload():
+    values = np.arange(1000 * 8, dtype='f4').reshape(1000, 8)
+    source = Observed(values, (1, 8))
+    ids = [*range(7, 997, 17), 999, 7, 24]
+    stats = ReadStats()
+    result = read_rows(ArrayReader(source), ids[::-1], stats=stats)
+    assert result.tobytes() == values[ids[::-1]].tobytes()
+    selected = [i for call in source.calls for i in range(
+        call[0].start, call[0].stop, call[0].step,
+    )]
+    assert selected == sorted(set(ids))
+    assert stats.requests == 2
+
+
+def test_sparse_runs_split_inside_a_small_shared_budget():
+    values = np.arange(2000 * 4, dtype='f4').reshape(2000, 4)
+    source = Observed(values, (1, 4))
+    ids = list(range(3, 1999, 13)) + [16, 3]
+    pool = ReadBudget(len(ids) * 16 + 128)
+    result = read_rows(ArrayReader(source, shared_budget=pool), ids)
+    assert result.tobytes() == values[ids].tobytes()
+    assert pool.snapshot()['used_bytes'] == 0
+    selected = [i for call in source.calls for i in range(
+        call[0].start, call[0].stop, call[0].step,
+    )]
+    assert selected == sorted(set(ids))
 
 
 def test_long_runs_split_at_budget_and_gaps_without_reading_unrequested_rows():

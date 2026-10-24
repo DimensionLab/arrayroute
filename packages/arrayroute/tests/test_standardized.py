@@ -133,3 +133,32 @@ def test_apply_training_statistics_without_refitting_held_out_data():
     assert backend.parameters[0].source_sha256 == hashlib.sha256(train.tobytes()).hexdigest()
     with pytest.raises(ValueError, match='Invalid recorded'):
         StandardizedChannelsBackend([reader(train)], parameters=[replace(fitted, spread=(0., 1.))])
+
+
+def test_sparse_application_caps_native_requests_without_changing_values():
+    from arrayroute.budget import ReadBudget
+    from arrayroute.plan import ArraySpec, plan
+
+    values = np.random.default_rng(17).normal(size=(10003, 4)).astype('f4')
+    fitted = fit_channel_standardization(reader(values))
+    source = NumpyBackend(values)
+    source.spec = ArraySpec(values.shape, (128, 4), 4)
+    requests = []
+    original = source.read
+
+    def read(selection):
+        requests.append(plan(source.spec, selection))
+        return original(selection)
+
+    source.read = read
+    pool = ReadBudget(1 << 20)
+    bounded = StandardizedChannelsBackend([ArrayReader(source, shared_budget=pool)],
+                                          parameters=[fitted], workspace_bytes=4096)
+    actual = ArrayReader(bounded).read((slice(3, 10003, 73), slice(None)))
+    expected_backend = StandardizedChannelsBackend([reader(values)], parameters=[fitted])
+    expected = ArrayReader(expected_backend).read((slice(3, 10003, 73), slice(None)))
+    assert actual.tobytes() == expected.tobytes()
+    assert len(requests) > 1
+    assert max(r.buffer_bytes_upper_bound for r in requests) <= 4096
+    assert pool.snapshot()['peak_bytes'] <= 4096
+    assert pool.snapshot()['used_bytes'] == 0
