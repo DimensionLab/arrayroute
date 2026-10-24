@@ -1848,3 +1848,12 @@ The allowance covers a returned source block plus a contiguous conversion buffer
 ownership, reader scratch, sink codec buffers and OS caches are separate. A sink must finish
 consuming the supplied buffer before returning. Source owners must remain open throughout
 transfer. Publication belongs to the caller; use `staged_directory` for new local datasets.
+
+`ReadSettings` also carries `tensorstore_cache_bytes` (default zero) and `immutable`
+(default false). Its plain dataclass representation can be serialized with `dataclasses.asdict`
+and reconstructed without executable factories. Cache/freshness variants have distinct
+policy names. `session(buffer_bytes)` applies both to the worker-owned local session.
+The TensorStore cache is a soft limit separate from reader buffers; immutable mode is a
+caller assertion that values stay unchanged, not snapshot isolation. Other engines reject
+a nonzero TensorStore cache allowance. Native cache hit/miss counts are not inferred from
+ArrayRoute's conservative planned decode-byte statistics.
