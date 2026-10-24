@@ -658,6 +658,15 @@ array = group.create_array(
 The defaults target 32-cell chunk edges, 128-cell shard edges, at most 512 KiB decoded
 per chunk and 32 MiB decoded per shard, including edge padding. Byte limits take priority
 over edge targets and requested time steps per chunk. Small arrays remain unsharded.
+With `steps_per_chunk=None` (the default), complete small frames share a time chunk:
+`min(max_time_steps, max(1, chunk_bytes // full_frame_bytes))`, limited by the array's
+time extent. `max_time_steps` defaults to 4096. The estimate uses the complete frame,
+not a spatial brick, so large volumes keep one step per chunk. Explicit
+`steps_per_chunk=1` retains independent frames; any positive explicit step limit
+overrides the automatic time cap but still respects byte and axis limits.
+The versioned policy is `bounded-spatiotemporal-grid-v2`. Record its configuration
+and the resulting chunks/shards to reproduce the physical layout. Repacking preserves
+decoded values but changes encoded objects and their hashes.
 The policy reports an upper bound on storage-object count; it does not predict compressed
 size, temporary codec memory or transport bytes. This is a configurable balanced heuristic,
 not an automatically optimal layout. Full-volume training, sparse regions, object stores

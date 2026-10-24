@@ -8,6 +8,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from operator import index
 
+ALGORITHM = "bounded-spatiotemporal-grid-v2"
+
 
 @dataclass(frozen=True)
 class GridLayout:
@@ -22,8 +24,9 @@ class GridLayout:
 class GridLayoutPolicy:
     """Balance spatial retrieval against object count; not a universal optimal layout.
 
-    Spatial edges are upper targets. Byte limits include padded edge blocks. Time steps
-    are kept in separate shards by default; requested steps_per_chunk is an upper bound.
+    Spatial edges are upper targets. Byte limits include padded edge blocks. Automatic
+    temporal packing uses full-frame bytes; large frames keep one step per shard.
+    Explicit steps_per_chunk is an upper bound and overrides the automatic step cap.
     Component/other axes stay together unless explicit axis caps or the byte limit split them.
     No values are read and no numerical conversion is performed.
     """
@@ -32,9 +35,12 @@ class GridLayoutPolicy:
     shard_edge: int = 128
     chunk_bytes: int = 512 << 10
     shard_bytes: int = 32 << 20
+    max_time_steps: int = 4096
 
     def __post_init__(self) -> None:
-        for name in ("chunk_edge", "shard_edge", "chunk_bytes", "shard_bytes"):
+        for name in ("chunk_edge", "shard_edge", "chunk_bytes", "shard_bytes", "max_time_steps"):
+            if isinstance(getattr(self, name), bool):
+                raise TypeError("Layout limits require integers, not booleans")
             value = index(getattr(self, name))
             if value < 1:
                 raise ValueError("Layout edges and byte limits must be positive")
@@ -49,12 +55,15 @@ class GridLayoutPolicy:
         itemsize: int,
         spatial_axes: Sequence[int],
         time_axis: int | None = None,
-        steps_per_chunk: int = 1,
+        steps_per_chunk: int | None = None,
         axis_chunk_limits: Mapping[int, int] | None = None,
     ) -> GridLayout:
         shape = tuple(index(n) for n in shape)
         axes = tuple(index(a) for a in spatial_axes)
-        itemsize, steps = index(itemsize), index(steps_per_chunk)
+        itemsize = index(itemsize)
+        if isinstance(steps_per_chunk, bool):
+            raise TypeError("Steps per chunk must be an integer or None")
+        steps = 1 if steps_per_chunk is None else index(steps_per_chunk)
         time_axis = None if time_axis is None else index(time_axis)
         if self.chunk_bytes < itemsize:
             raise ValueError("Chunk byte limit must fit at least one element")
@@ -68,6 +77,11 @@ class GridLayoutPolicy:
             raise ValueError("Time axis must be distinct from spatial axes and within array rank")
         if itemsize > self.chunk_bytes:
             raise ValueError("A single value exceeds the chunk byte limit")
+        if time_axis is not None and steps_per_chunk is None:
+            frame_bytes = (
+                math.prod(n for axis, n in enumerate(shape) if axis != time_axis) * itemsize
+            )
+            steps = min(self.max_time_steps, max(1, self.chunk_bytes // frame_bytes))
         chunks = list(shape)
         for axis in axes:
             chunks[axis] = min(shape[axis], self.chunk_edge)

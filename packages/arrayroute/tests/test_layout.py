@@ -76,14 +76,20 @@ def test_station_columns_split_variables_and_preserve_bounded_objects():
 
     shape = (192, 13, 33, 81, 5)
     layout = GridLayoutPolicy(chunk_edge=1, shard_edge=32).plan(
-        shape, itemsize=4, spatial_axes=(2, 3), time_axis=0,
-        steps_per_chunk=16, axis_chunk_limits={4: 1},
+        shape,
+        itemsize=4,
+        spatial_axes=(2, 3),
+        time_axis=0,
+        steps_per_chunk=16,
+        axis_chunk_limits={4: 1},
     )
     assert layout.chunks == (16, 13, 1, 1, 1)
     assert layout.shards == (16, 13, 32, 32, 1)
     assert layout.object_count_upper_bound == 360
-    request = plan(ArraySpec(shape, layout.chunks, 4),
-                   (slice(None), slice(None), slice(16, 17), slice(40, 41), slice(0, 1)))
+    request = plan(
+        ArraySpec(shape, layout.chunks, 4),
+        (slice(None), slice(None), slice(16, 17), slice(40, 41), slice(0, 1)),
+    )
     assert request.output_bytes == request.decoded_bytes_upper_bound == 9984
     assert request.chunks_touched == 12
 
@@ -103,5 +109,59 @@ def test_axis_caps_compose_with_time_spatial_and_byte_limits_deterministically()
 )
 def test_invalid_axis_caps(limits):
     with pytest.raises((TypeError, ValueError)):
-        GridLayoutPolicy().plan((20, 30, 4), itemsize=4, spatial_axes=(0, 1),
-                                axis_chunk_limits=limits)
+        GridLayoutPolicy().plan(
+            (20, 30, 4), itemsize=4, spatial_axes=(0, 1), axis_chunk_limits=limits
+        )
+
+
+def test_tiny_histories_pack_time_without_enumerating_rows():
+    policy = GridLayoutPolicy()
+    layout = policy.plan((10**12, 1, 1, 1), itemsize=4, spatial_axes=(1, 2), time_axis=0)
+    assert layout.chunks == (4096, 1, 1, 1)
+    assert layout.shards is None
+    assert layout.decoded_chunk_bytes == 16384
+    assert layout.object_count_upper_bound == (10**12 + 4095) // 4096
+    assert layout == policy.plan((10**12, 1, 1, 1), itemsize=4, spatial_axes=(1, 2), time_axis=0)
+
+
+def test_auto_time_uses_full_frame_not_spatial_brick_and_respects_overrides():
+    policy = GridLayoutPolicy(
+        chunk_edge=4, shard_edge=8, chunk_bytes=4096, shard_bytes=16384, max_time_steps=32
+    )
+    small = policy.plan((1000, 8, 8, 2), itemsize=4, spatial_axes=(1, 2), time_axis=0)
+    assert small.chunks[0] == 8
+    large = policy.plan((1000, 64, 64, 2), itemsize=4, spatial_axes=(1, 2), time_axis=0)
+    assert large.chunks[0] == 1
+    explicit = policy.plan(
+        (1000, 1, 1, 1), itemsize=4, spatial_axes=(1, 2), time_axis=0, steps_per_chunk=64
+    )
+    assert explicit.chunks[0] == 64
+    isolated = policy.plan(
+        (1000, 1, 1, 1), itemsize=4, spatial_axes=(1, 2), time_axis=0, steps_per_chunk=1
+    )
+    assert isolated.chunks == (1, 1, 1, 1)
+    capped = policy.plan(
+        (1000, 1, 1, 1), itemsize=4, spatial_axes=(1, 2), time_axis=0, axis_chunk_limits={0: 3}
+    )
+    assert capped.chunks[0] == 3
+
+
+@pytest.mark.parametrize("limit", [0, -1, True, 1.5])
+def test_invalid_automatic_time_limit(limit):
+    with pytest.raises((ValueError, TypeError)):
+        GridLayoutPolicy(max_time_steps=limit)
+
+
+@pytest.mark.parametrize("steps", [0, -1, True, 1.5])
+def test_invalid_explicit_time_limit(steps):
+    with pytest.raises((ValueError, TypeError)):
+        GridLayoutPolicy().plan(
+            (20, 2, 2), itemsize=4, spatial_axes=(1,), time_axis=0, steps_per_chunk=steps
+        )
+
+
+def test_time_axis_can_be_in_the_middle():
+    policy = GridLayoutPolicy(chunk_bytes=8192, shard_bytes=32768)
+    layout = policy.plan((7, 10000, 9, 2), itemsize=8, spatial_axes=(0, 2), time_axis=1)
+    assert layout.chunks == (7, 8, 9, 2)
+    assert layout.decoded_chunk_bytes <= 8192
