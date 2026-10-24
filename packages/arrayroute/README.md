@@ -1956,3 +1956,44 @@ Results can differ in last bits across source dtypes; pin dtype, runtime and inp
 for exact replay. The final component axis is removed; selections retain source order.
 Cancellation occurs between native reads and numerical blocks. Hashing this derived reader
 checks magnitude bytes only, not the original vector directions, units or source metadata.
+
+### Fitted channel standardization
+
+`arrayroute.standardized.StandardizedChannelsBackend` combines aligned `(time, channel)`
+readers into a lazy float64 standardized view. Two ordered passes fit finite per-channel
+statistics; no complete history or concatenation of histories is required.
+
+```python
+from arrayroute.standardized import StandardizedChannelsBackend
+from arrayroute.reader import ArrayReader
+
+fitted = StandardizedChannelsBackend(training_sources, workspace_bytes=32 << 20)
+training = ArrayReader(fitted, buffer_bytes=16 << 20)
+batch = training.read((slice(100, 200), slice(None)))
+
+# Reuse the training fit for validation/inference; do not fit held-out data.
+held_out = ArrayReader(StandardizedChannelsBackend(
+    held_out_sources, parameters=fitted.parameters, workspace_bytes=32 << 20,
+))
+```
+
+Each immutable `ChannelStandardization` records offset, scale, center, spread, finite counts,
+algorithm and native fitting-source SHA-256. Serialize with `dataclasses.asdict` and restore
+with `ChannelStandardization(**record)`. The hash identifies the fitting bytes, not held-out
+inputs, metadata or units. Pin source revisions and metadata throughout fitting and reads.
+Both fitting passes must have identical bytes; this check is not snapshot isolation.
+
+Finite ranges provide safe affine scaling before fixed 4096-row canonical moments.
+NaN/infinity are excluded from fitting. Missing-only channels produce NaN; constant channels
+produce zero for their fitted value. Nonfinite inputs remain visible in quality checks.
+Results are dimensionless; source values, physical units and metadata are untouched.
+Exact replay requires the same ordered sources, channel grouping, dtype and numerical
+runtime. Read allowances and admitted workspace sizes do not change the fitted result.
+The versioned reduction can differ from whole-array NumPy moments in the last bits.
+
+The default 32 MiB workspace is admitted per source: fitting requires
+`channels * (4096 * 96 + 256)` bytes; applying recorded parameters requires at least
+`channels * (source_itemsize + 24)`. Wide inputs fail before payload reads. Reader buffers,
+native caches, the outer derived output, parameter metadata and caller-retained results
+are additional. This is not a global RSS cap. Sources are borrowed; nested readers must not
+share the same reservation pool. Cancellation is cooperative between reads and blocks.

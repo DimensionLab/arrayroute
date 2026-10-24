@@ -99,9 +99,8 @@ class VectorMagnitudeBackend:
                     np.sqrt(magnitude, out=magnitude)
                 else:
                     magnitude = np.hypot.reduce(values, axis=-1)
-                    for component in values.T:
-                        np.copyto(magnitude, np.nan, where=np.isnan(component))
-                    del component
+                    for index in range(components):
+                        np.copyto(magnitude, np.nan, where=np.isnan(values[:, index]))
                 flat[start:stop] = magnitude
             del raw, values, magnitude
         self._check_cancelled()
