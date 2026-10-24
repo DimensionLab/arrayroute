@@ -63,6 +63,11 @@ class VectorMagnitudeBackend:
         if self.rows_per_block < 1:
             raise MemoryError("Source/transform allowance cannot fit one complete vector")
         self.source = source
+        self.source_budgets = tuple(
+            pool for pool in ((source.shared_budget,) +
+                              tuple(getattr(source.backend, "source_budgets", ())))
+            if pool is not None
+        )
         self.workspace_bytes = workspace_bytes
         self.source_stats = source_stats if source_stats is not None else ReadStats()
         self.cancelled = cancelled

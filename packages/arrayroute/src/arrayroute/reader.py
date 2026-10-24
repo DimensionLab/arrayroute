@@ -46,6 +46,10 @@ class ArrayReader:
     ):
         if buffer_bytes < 1:
             raise ValueError("buffer_bytes must be positive")
+        if shared_budget is not None and any(
+            shared_budget is pool for pool in getattr(backend, "source_budgets", ())
+        ):
+            raise ValueError("Derived output cannot reserve its source's shared read pool")
         self.backend = backend
         self.buffer_bytes = (min(buffer_bytes, shared_budget.max_bytes)
                              if shared_budget is not None else buffer_bytes)

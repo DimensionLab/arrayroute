@@ -2106,3 +2106,33 @@ for spatial means only. Probe state and output are admitted against the numerica
 Record `DIAGNOSTIC_ALGORITHM` alongside these results. `finite` must be checked before
 interpreting diagnostics for nonfinite predictions. `exact_copy` compares original source
 values before float64 conversion; it is value equality, not a source-file fingerprint.
+
+## Lazy stacks and ordered means
+
+`StackBackend` adds a leading member axis over existing readers. `MeanBackend` reads
+matching regions in supplied member order and returns a compensated float64 mean. Neither
+materializes complete sources. Both require identical source shapes and dtypes.
+
+```python
+from arrayroute.composite import MeanBackend, StackBackend
+from arrayroute.reader import ArrayReader
+
+mean = ArrayReader(MeanBackend(member_readers, workspace_bytes=8 << 20),
+                   buffer_bytes=32 << 20)
+stack = ArrayReader(StackBackend(member_readers, workspace_bytes=8 << 20),
+                    buffer_bytes=32 << 20)
+```
+
+The enclosing reader admits output; backend workspace and the active source reader's
+allowance are additional. Codec scratch and caches remain additional. Sources are read
+sequentially, and workspace does not grow with member count. The caller owns source
+lifetimes and must keep their contents immutable. Output cannot share a read-budget pool
+with any nested source: the reader rejects that recursive reservation to prevent deadlocks.
+
+Stack selections preserve native bytes. Means use
+`ordered-scaled-compensated-mean-f64-v1`, with scaling before addition and a fixed member
+order. Read budgets and chunk layouts do not change arithmetic ordering. Reordering sources,
+changing platforms or matching older float32 means bitwise is outside that guarantee.
+Finite-input arithmetic overflow raises; nonfinite inputs propagate IEEE values. Cancellation
+is checked between source reads; it cannot interrupt a blocking backend operation.
+`source_stats` measures underlying reads separately from the outer reader's derived output.
