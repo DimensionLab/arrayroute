@@ -7,7 +7,31 @@ from types import SimpleNamespace
 import psutil
 import pytest
 
-from arrayroute.memory import ProcessTreeMemory
+from arrayroute.memory import ProcessTreeMemory, peak_process_rss_bytes
+
+
+def test_real_os_peak_is_positive_and_does_not_decrease():
+    before = peak_process_rss_bytes()
+    allocation = bytearray(4 << 20)
+    assert peak_process_rss_bytes() >= before > 0
+    assert len(allocation) == 4 << 20
+
+
+@pytest.mark.parametrize("platform, expected", [("darwin", 123), ("linux", 123 * 1024)])
+def test_peak_memory_normalizes_unix_units(monkeypatch, platform, expected):
+    monkeypatch.setattr(sys, "platform", platform)
+    monkeypatch.setitem(sys.modules, "resource", SimpleNamespace(
+        RUSAGE_SELF=0, getrusage=lambda _: SimpleNamespace(ru_maxrss=123),
+    ))
+    assert peak_process_rss_bytes() == expected
+
+
+def test_windows_peak_uses_high_water_mark_not_current_rss(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(psutil, "Process", lambda: SimpleNamespace(
+        memory_info=lambda: SimpleNamespace(rss=123, peak_wset=456),
+    ))
+    assert peak_process_rss_bytes() == 456
 
 
 @pytest.mark.parametrize("interval", [0, -1, float("inf"), float("nan")])

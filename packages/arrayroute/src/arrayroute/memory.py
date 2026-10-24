@@ -4,9 +4,29 @@
 from __future__ import annotations
 
 import math
+import sys
 import threading
 import time
 from typing import Any
+
+
+def peak_process_rss_bytes() -> int:
+    """OS high-water RSS for this process only, in bytes; excludes GPU memory.
+
+    Windows uses psutil's PeakWorkingSetSize. Unix getrusage uses bytes on macOS
+    and KiB on Linux. This lifetime peak is not a sampled process-tree total.
+    """
+    if sys.platform == "win32":
+        try:
+            import psutil
+        except ImportError as exc:
+            raise ImportError("Install arrayroute[profiling] to measure peak memory") from exc
+        info: Any = psutil.Process().memory_info()
+        return int(info.peak_wset)
+    import resource
+
+    value = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return int(value if sys.platform == "darwin" else value * 1024)
 
 
 class ProcessTreeMemory:

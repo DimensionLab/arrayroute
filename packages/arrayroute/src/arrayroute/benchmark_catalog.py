@@ -8,7 +8,6 @@ import hashlib
 import json
 import platform
 import random
-import resource
 import sqlite3
 import statistics
 import subprocess
@@ -19,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from .catalog import Catalog, write_catalog
+from .memory import peak_process_rss_bytes
 
 
 def record(index: int) -> tuple[str, dict[str, Any]]:
@@ -54,13 +54,12 @@ def worker(root: Path, engine: str, count: int) -> None:
             selected = catalog.get(key).value
     elapsed = time.perf_counter() - start
     checksum = digest([page, selected])
-    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     print(
         json.dumps(
             {
                 "engine": engine,
                 "operation_seconds": elapsed,
-                "peak_rss_bytes": rss if sys.platform == "darwin" else rss * 1024,
+                "peak_rss_bytes": peak_process_rss_bytes(),
                 "result_sha256": checksum,
             }
         )

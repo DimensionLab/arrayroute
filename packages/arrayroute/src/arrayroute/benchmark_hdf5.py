@@ -8,7 +8,6 @@ import hashlib
 import json
 import os
 import random
-import resource
 import subprocess
 import sys
 import time
@@ -17,6 +16,7 @@ from pathlib import Path
 import numpy as np
 
 from .hdf5 import HDF5ReadSession
+from .memory import peak_process_rss_bytes
 from .reader import ReadStats
 
 
@@ -60,12 +60,11 @@ def worker(path: Path, mode: str, operation: str) -> dict:
             else:
                 result = session.inspect_columns(stats=stats)
     elapsed = time.perf_counter() - start
-    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     return dict(
         mode=mode,
         operation=operation,
         seconds=elapsed,
-        peak_rss_bytes=rss if sys.platform == "darwin" else rss * 1024,
+        peak_rss_bytes=peak_process_rss_bytes(),
         result_sha256=hashlib.sha256(json.dumps(result, sort_keys=True).encode()).hexdigest(),
         stats=vars(stats),
         pid=os.getpid(),

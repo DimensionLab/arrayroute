@@ -10,7 +10,6 @@ import itertools
 import json
 import os
 import platform
-import resource
 import subprocess
 import sys
 import time
@@ -19,6 +18,8 @@ from pathlib import Path
 import numpy as np
 
 from arrayroute.permutation import Permutation
+
+from .memory import peak_process_rss_bytes
 
 
 def measure(engine: str, size: int, samples: int) -> dict:
@@ -52,7 +53,6 @@ def measure(engine: str, size: int, samples: int) -> dict:
     seconds = time.perf_counter() - started
     assert len(values) == len(set(values)) == samples
     assert all(0 <= value < size for value in values)
-    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     versions = {name: importlib.metadata.version(name) for name in ["numpy", "arrayroute"]}
     if engine == "torch":
         versions["torch"] = importlib.metadata.version("torch")
@@ -62,7 +62,7 @@ def measure(engine: str, size: int, samples: int) -> dict:
         "sampled_indices": samples,
         "first_index_seconds": first_seconds,
         "seconds": seconds,
-        "peak_rss_bytes": rss if sys.platform == "darwin" else rss * 1024,
+        "peak_rss_bytes": peak_process_rss_bytes(),
         "index_sha256": hashlib.sha256(np.asarray(values, dtype="<i8").tobytes()).hexdigest(),
         "versions": versions,
     }

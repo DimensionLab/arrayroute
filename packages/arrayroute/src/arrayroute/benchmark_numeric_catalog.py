@@ -8,7 +8,6 @@ import itertools
 import json
 import platform
 import random
-import resource
 import sqlite3
 import statistics
 import subprocess
@@ -18,6 +17,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+from .memory import peak_process_rss_bytes
 from .numeric_catalog import NumericCursor, NumericIndex, write_numeric_index
 
 
@@ -90,8 +90,7 @@ def worker(root: Path, mode: str) -> dict:
         seconds=elapsed,
         verified=True,
         result_sha256=hashlib.sha256(json.dumps(result).encode()).hexdigest(),
-        peak_rss_bytes=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        * (1 if sys.platform == "darwin" else 1024),
+        peak_rss_bytes=peak_process_rss_bytes(),
     )
 
 

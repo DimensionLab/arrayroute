@@ -557,7 +557,7 @@ Compare lossless compression on synthetic float fields, phase masks, mesh connec
 and incompressible random bits:
 
 ```sh
-python -m pip install './packages/arrayroute[codecs]'
+python -m pip install './packages/arrayroute[codecs,profiling]'
 python -m arrayroute.benchmark_codecs --output /tmp/arrayroute-codecs
 # On a compatible NVIDIA CUDA 12 host, install [gpu-codecs] and include GPU candidates:
 python -m arrayroute.benchmark_codecs --output /tmp/arrayroute-gpu-codecs \

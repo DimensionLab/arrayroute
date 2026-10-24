@@ -9,13 +9,14 @@ import importlib.metadata
 import json
 import os
 import platform
-import resource
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 import numpy as np
+
+from .memory import peak_process_rss_bytes
 
 PATTERNS = ("velocity", "noisy-velocity", "random-bits", "phase-mask", "connectivity")
 CPU_CODECS = ("zstd", "blosc-zstd-shuffle", "blosc-zstd-bitshuffle", "blosc-lz4-bitshuffle")
@@ -242,7 +243,6 @@ def measure(
         raise ValueError(name)
     if digest(source) != source_hash:
         raise ValueError("Source bytes changed during codec measurement")
-    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     return {
         "codec": name,
         "pattern": pattern if input_path is None else "input",
@@ -260,7 +260,7 @@ def measure(
         "versions": versions,
         "hardware": hardware,
         "blosc_threads": threads,
-        "peak_process_rss_bytes": rss if sys.platform == "darwin" else rss * 1024,
+        "peak_process_rss_bytes": peak_process_rss_bytes(),
         "measurements": records,
     }
 

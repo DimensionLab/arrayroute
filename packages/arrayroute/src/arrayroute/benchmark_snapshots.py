@@ -9,13 +9,14 @@ import importlib.metadata
 import json
 import os
 import random
-import resource
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 import numpy as np
+
+from .memory import peak_process_rss_bytes
 
 
 def worker(
@@ -46,14 +47,13 @@ def worker(
         checks.append(hashlib.sha256(frame.tobytes()).hexdigest())
         del frame
     assert checks == [fixture["hashes"][t] for t in fixture["order"]]
-    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     print(
         json.dumps(
             {
                 "mode": mode,
                 "open_s": opened,
                 "read_s": seconds,
-                "process_peak_rss_bytes": rss * (1 if sys.platform == "darwin" else 1024),
+                "process_peak_rss_bytes": peak_process_rss_bytes(),
                 "verified_frames": len(checks),
                 "verified": True,
                 "snapshot_concurrency": concurrency if mode == "snapshot" else None,

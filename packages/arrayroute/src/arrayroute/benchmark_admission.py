@@ -7,7 +7,6 @@ import hashlib
 import json
 import platform
 import random
-import resource
 import subprocess
 import sys
 import time
@@ -17,6 +16,7 @@ from pathlib import Path
 import numpy as np
 
 from .execution import ordered_map
+from .memory import peak_process_rss_bytes
 
 
 def run_trial(policy: str, unit_bytes: int) -> dict:
@@ -51,12 +51,11 @@ def run_trial(policy: str, unit_bytes: int) -> dict:
     tracemalloc.stop()
     if digests != expected:
         raise ValueError('Ordered payload bytes differ from the independent reference')
-    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     return {
         'policy': policy, 'unit_bytes': unit_bytes, 'payload_bytes': sum(sizes),
         'planned_queue_bytes': unit_bytes * 8 if policy == 'bytes' else None,
         'seconds': seconds, 'peak_traced_bytes': peak,
-        'peak_rss_bytes': rss if sys.platform == 'darwin' else rss * 1024,
+        'peak_rss_bytes': peak_process_rss_bytes(),
         'digest_sha256': hashlib.sha256(json.dumps(digests).encode()).hexdigest(),
         'verified': True, 'workers': 4, 'max_pending': 8, 'consumer_delay_seconds': .01,
     }

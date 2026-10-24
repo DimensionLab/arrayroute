@@ -7,12 +7,12 @@ import argparse
 import hashlib
 import json
 import platform
-import resource
 import time
 from pathlib import Path
 
 import numpy as np
 
+from .memory import peak_process_rss_bytes
 from .statistics import CanonicalChannelMoments, ChannelMoments
 
 
@@ -94,9 +94,7 @@ def main() -> None:
                 "result_sha256": hashlib.sha256(bits).hexdigest(),
                 "mean_variance": result.tolist(),
                 "max_abs_difference_from_legacy": float(np.max(np.abs(result - baseline))),
-                "process_peak_rss_platform_units": (
-                    resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-                ),
+                "process_peak_rss_bytes": peak_process_rss_bytes(),
             }
             trials.append(trial)
             args.output.parent.mkdir(parents=True, exist_ok=True)

@@ -7,12 +7,12 @@ import hashlib
 import json
 import pickle
 import platform
-import resource
-import sys
 import time
 from pathlib import Path
 
 from arrayroute.permutation import BatchPartition, Permutation
+
+from .memory import peak_process_rss_bytes
 
 
 def measure(size: int, world_size: int, batch_size: int, batches: int, epoch: int) -> dict:
@@ -51,14 +51,13 @@ def measure(size: int, world_size: int, batch_size: int, batches: int, epoch: in
     if len(observed_values) != count:
         raise ValueError("Rank selection omitted or repeated values")
     elapsed = time.perf_counter() - started
-    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     return {
         "size": size, "world_size": world_size, "batch_size": batch_size, "epoch": epoch,
         "start_batch": start_batch, "rank_batches_requested": batches,
         "sampled_indices": count, "dropped_global_tail": first.dropped_samples,
         "rank_planning_seconds": timings, "total_with_verification_seconds": elapsed,
         "max_pickled_plan_bytes": plan_bytes, "indices_sha256": digest.hexdigest(),
-        "peak_process_rss_bytes": rss if sys.platform == "darwin" else rss * 1024,
+        "peak_process_rss_bytes": peak_process_rss_bytes(),
     }
 
 
