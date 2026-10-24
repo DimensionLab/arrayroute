@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import multiprocessing
+import threading
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
 import numpy as np
@@ -8,7 +9,12 @@ import zarr
 
 ic = pytest.importorskip("icechunk")
 
-from arrayroute.preparation import PartitionGrid, Preparation, PreparationError  # noqa: E402
+from arrayroute.preparation import (  # noqa: E402
+    PartitionGrid,
+    Preparation,
+    PreparationCancelledError,
+    PreparationError,
+)
 from arrayroute.snapshot import FilesystemRepository, Snapshot, SnapshotReadSession  # noqa: E402
 
 
@@ -128,12 +134,13 @@ def test_failed_worker_checkpoints_success_and_resume_skips_done(data):
     assert len(seen) == 4
 
 
-def test_spawned_workers_and_digest_failure(data):
+@pytest.mark.parametrize("verification_workers", [1, 4])
+def test_spawned_workers_and_digest_failure(data, verification_workers):
     snapshot, repo, values = data
     job = prepare(snapshot)
     with ProcessPoolExecutor(2, mp_context=multiprocessing.get_context("spawn")) as pool:
         assert job.run(np.negative, pool, batch_tasks=2) == 6
-    published = job.publish()
+    published = job.publish(verification_workers=verification_workers)
     np.testing.assert_array_equal(
         SnapshotReadSession(published).read("prepared", (slice(None),) * 2), -values
     )
@@ -141,7 +148,31 @@ def test_spawned_workers_and_digest_failure(data):
     zarr.open_array(changed.store, path="prepared", mode="r+")[0, 0] = 3
     changed.commit("simulate corrupt/replaced output after completion")
     with pytest.raises(ValueError, match="digest mismatch"):
-        job.publish()
+        job.publish(verification_workers=verification_workers)
+
+
+def test_parallel_publication_reuses_revision_and_shares_budget(data, monkeypatch):
+    import arrayroute.preparation as preparation
+
+    snapshot, _, _ = data
+    job = prepare(snapshot)
+    with ThreadPoolExecutor(2) as pool:
+        job.run(np.negative, pool)
+    published = job.publish()
+    observed = []
+    verify = preparation._verify_partition
+
+    def observe(*args):
+        observed.append(args[-1])
+        return verify(*args)
+
+    monkeypatch.setattr(preparation, "_verify_partition", observe)
+    assert job.publish(verification_workers=3, buffer_bytes=3 << 20) == published
+    assert observed == [1 << 20] * job.grid.count
+    with pytest.raises(MemoryError, match="budget"):
+        job.publish(verification_workers=3, buffer_bytes=300)
+    with pytest.raises(ValueError, match="positive"):
+        job.publish(verification_workers=0)
 
 
 def test_bad_results_budget_and_cancellation_never_mark_done(data):
@@ -159,6 +190,64 @@ def test_bad_results_budget_and_cancellation_never_mark_done(data):
         with pytest.raises(InterruptedError):
             job.run(np.negative, pool, cancelled=lambda: True)
         assert len(list(job.pending())) == 6
+
+
+@pytest.mark.parametrize("timeout", [0, -1, float("nan"), float("inf")])
+def test_invalid_wait_deadline_does_not_submit(data, timeout):
+    snapshot, _, _ = data
+    job = prepare(snapshot)
+    with ThreadPoolExecutor(1) as pool:
+        with pytest.raises(ValueError, match="finite and positive"):
+            job.run(np.negative, pool, batch_timeout_seconds=timeout)
+    assert len(list(job.pending())) == job.grid.count
+
+
+@pytest.mark.parametrize("stop", ["cancel", "timeout"])
+def test_stalled_worker_checkpoints_success_and_late_result_is_not_published(data, stop):
+    snapshot, repo, values = data
+    job = prepare(snapshot)
+    release = threading.Event()
+    submitted = []
+    pool = ThreadPoolExecutor(2)
+
+    class RecordedExecutor:
+        def submit(self, *args):
+            future = pool.submit(*args)
+            submitted.append(future)
+            return future
+
+    def stalled(block):
+        if block[0, 0] == 0:
+            assert release.wait(10), "Test must release its stalled worker"
+            return block + 999  # Deliberately wrong late work must never replace the retry.
+        return -block
+
+    try:
+        if stop == "cancel":
+            with pytest.raises(PreparationCancelledError) as caught:
+                job.run(stalled, RecordedExecutor(), batch_tasks=2,
+                        cancelled=lambda: len(submitted) == 2 and submitted[1].done())
+        else:
+            with pytest.raises(PreparationError) as caught:
+                job.run(stalled, RecordedExecutor(), batch_tasks=2, batch_timeout_seconds=1)
+            assert caught.value.reason == "timeout" and caught.value.tasks == [0]
+        assert caught.value.snapshot_id == repo.lookup_branch("work")
+        assert submitted[0].running()
+        assert list(job.pending()) == [0, 2, 3, 4, 5]
+        resumed = Preparation.resume(snapshot.location, branch="work", job="gradient",
+                                     operation="gradient-v1", parameters={"spacing_m": 2})
+        with ThreadPoolExecutor(2) as replacement:
+            assert resumed.run(np.negative, replacement, batch_tasks=2) == 5
+        published = resumed.publish()
+        release.set()
+        submitted[0].result(timeout=10)
+        assert repo.lookup_branch("work") == published.snapshot_id
+        actual = SnapshotReadSession(published).read("prepared", (slice(None),) * 2)
+        np.testing.assert_array_equal(actual, -values)
+        assert list(resumed.pending()) == []
+    finally:
+        release.set()
+        pool.shutdown(wait=True, cancel_futures=True)
 
 
 def test_lost_worker_result_is_invisible_and_retried(data):

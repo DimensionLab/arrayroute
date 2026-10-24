@@ -856,9 +856,51 @@ After interruption, use `Preparation.resume(location, branch=..., job=...,
 operation="numpy-gradient-x-v1", parameters={"spacing_m": 2})`, then `run` with the same
 operator. `pending()` streams task IDs in bounded progress blocks. `PreparationError`
 reports failed IDs and the checkpoint retaining successful tasks. `run` returns the number
-of newly completed tasks. A cancellation callback is checked between batches, without
-killing native operations mid-write. Executors and worker cleanup belong to the caller.
+of newly completed tasks. A nonblocking cancellation callback is checked between batches
+and at most every 100 ms while waiting. Completed tasks are checkpointed before
+`PreparationCancelledError` (an `InterruptedError`) returns its `snapshot_id`.
+Set `batch_timeout_seconds` to bound waiting for submitted tasks: a timeout raises
+`PreparationError` with `reason="timeout"` and the unfinished task IDs. Storage commits
+and executor shutdown are outside that deadline. Already-running operations are not
+forcibly killed; their late forks stay unpublished, even if a replacement worker has
+already completed the task. Executors and worker cleanup belong to the caller.
 Thread executors are also supported and can be faster than processes for small operations.
+
+### Use an existing Dask scheduler
+
+Install `arrayroute[snapshots,dask]` on the coordinator and workers, with the same
+locked versions and operator code. Use Dask's standard `concurrent.futures` bridge:
+
+```python
+from distributed import Client
+
+with Client("tls://scheduler.example.com:8786", security=cluster_security) as client:
+    executor = client.get_executor(pure=False, retries=1)
+    try:
+        job.run(velocity_gradient, executor, batch_tasks=16,
+                buffer_bytes=128 << 20, batch_timeout_seconds=120)
+    finally:
+        executor.shutdown(wait=False)
+revision = job.publish()
+```
+
+`cluster_security` is the deployment's configured Dask TLS security object. Local
+tests use an explicitly loopback-bound `LocalCluster`. Keep schedulers and workers
+within the trusted deployment boundary: they execute submitted Python code.
+`pure=False` prevents scheduler reuse of tasks that mutate an Icechunk fork. Dask
+owns placement, worker restart and transport; ArrayRoute owns selections, output
+chunks, receipts and publication. Resource constraints can be supplied through
+`get_executor(resources=...)`; raw `distributed.Client` futures are not the standard
+Executor interface and must not be passed directly to `job.run`.
+
+The tested version is Dask/Distributed 2026.8.0. Integration tests run two real
+worker processes, deliberately terminate one during a task, and verify exact
+outputs after its restart. These are single-machine tests; all remote workers
+must share access to the pinned repository, and multi-host object-store writes
+remain a separate gate. Cancellation cannot undo already-started Python/native
+work, but its unmerged fork cannot replace a committed output.
+See Dask's [executor interoperability contract](https://github.com/dask/distributed/blob/main/docs/source/related-work.rst)
+and [task purity rules](https://github.com/dask/distributed/blob/main/docs/source/client.rst).
 
 Each operator must return the halo-expanded input shape and the declared dtype. The
 framework crops the owned core. You must choose appropriate halos, spacing, output units,
@@ -868,6 +910,12 @@ Budget checks cover planned read buffers, transform output and write copies; cus
 operator scratch, native codec caches and total process RSS require additional headroom.
 Publication also has a `buffer_bytes` limit and rereads every output core to verify its
 receipt. Hashes verify output integrity, not the scientific correctness of the operator.
+For parallel verification, use `publish(verification_workers=4, buffer_bytes=128 << 20)`.
+The total planned read allowance is divided across the active verification threads;
+each thread admits one output partition at a time. Increase the total allowance or
+reduce workers if a partition no longer fits. Verification still checks every receipt
+and every output hash before publication; re-verifying a complete revision preserves
+its snapshot ID. Thread/runtime metadata and native allocator overhead are additional.
 
 **Operational contract:** one trusted coordinator per work branch and trusted operator
 code/workers. This is not an access-control boundary, sandbox, distributed lock service,

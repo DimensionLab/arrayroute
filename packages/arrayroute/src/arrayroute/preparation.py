@@ -14,9 +14,11 @@ import json
 import math
 import re
 import threading
+import time
 import uuid
 from collections.abc import Callable, Iterator
-from concurrent.futures import Executor
+from concurrent.futures import FIRST_COMPLETED, Executor, ThreadPoolExecutor, wait
+from contextlib import nullcontext
 from dataclasses import dataclass
 from itertools import islice
 from operator import index
@@ -154,9 +156,29 @@ def _transform(
 class PreparationError(RuntimeError):
     """Successful tasks are checkpointed; reopen the work branch to retry missing tasks."""
 
-    def __init__(self, tasks: list[int], snapshot_id: str):
-        self.tasks, self.snapshot_id = tasks, snapshot_id
-        super().__init__(f"Preparation failed for tasks {tasks}; checkpoint {snapshot_id}")
+    def __init__(self, tasks: list[int], snapshot_id: str, *, reason: str = "worker"):
+        self.tasks, self.snapshot_id, self.reason = tasks, snapshot_id, reason
+        super().__init__(
+            f"Preparation {reason} failure for tasks {tasks}; checkpoint {snapshot_id}")
+
+
+class PreparationCancelledError(InterruptedError):
+    """The observed completed tasks were checkpointed before cancellation returned."""
+
+    def __init__(self, snapshot_id: str):
+        self.snapshot_id = snapshot_id
+        super().__init__(f"Preparation cancelled; checkpoint {snapshot_id}")
+
+
+def _verify_partition(
+    snapshot: Snapshot, output: str, part: Partition, expected: bytes, buffer_bytes: int,
+) -> None:
+    reader = _input_reader(snapshot, output, buffer_bytes)
+    plan = reader.plan(part.output)
+    if plan.buffer_bytes_upper_bound + plan.output_bytes > buffer_bytes:
+        raise MemoryError("Publication verification exceeds planned buffer budget")
+    if _digest(reader.read(part.output)) != expected:
+        raise ValueError(f"Output digest mismatch for task {part.number}")
 
 
 class Preparation:
@@ -325,29 +347,41 @@ class Preparation:
         batch_tasks: int = 8,
         buffer_bytes: int = 128 << 20,
         cancelled: Callable[[], bool] | None = None,
+        batch_timeout_seconds: float | None = None,
     ) -> int:
-        """Checkpoint bounded batches. Cancellation is observed between batches.
+        """Checkpoint bounded batches, including completed work on timeout/cancellation.
 
         A failed batch commits its successful workers before raising PreparationError.
         A lost coordinator can reopen the branch: uncommitted work is simply retried.
         Use one coordinator per branch; executor/worker lifecycle belongs to the caller.
+        The optional timeout bounds waiting for submitted tasks, not storage commits or
+        executor shutdown. Running tasks cannot be forcibly killed through Executor;
+        their late forks remain unpublished. Cancellation is polled at most every 100 ms
+        while waiting, and must be a nonblocking callback. Use Dask's get_executor()
+        bridge rather than passing a raw distributed.Client.
         """
         import zarr
 
         batch_tasks, buffer_bytes = index(batch_tasks), index(buffer_bytes)
         if min(batch_tasks, buffer_bytes) < 1:
             raise ValueError("Batch size and planned buffer budget must be positive")
+        if batch_timeout_seconds is not None and (
+            not math.isfinite(batch_timeout_seconds) or batch_timeout_seconds <= 0
+        ):
+            raise ValueError("Batch timeout must be finite and positive")
         self._check_writes()
         repo = _writable_repository(self.location)
         pending = self.pending()
         completed = 0
         while batch := list(islice(pending, batch_tasks)):
             if cancelled and cancelled():
-                raise InterruptedError("Preparation cancelled between checkpoints")
+                raise PreparationCancelledError(repo.lookup_branch(self.branch))
             session = repo.writable_session(self.branch)
             futures = []
             failed = []
             first_error: Exception | None = None
+            deadline = (time.monotonic() + batch_timeout_seconds
+                        if batch_timeout_seconds is not None else None)
             # Fork all tasks before merging: each starts from the same committed state.
             for number in batch:
                 try:
@@ -365,13 +399,40 @@ class Preparation:
                     failed.append(number)
                     first_error = first_error or exc
             results = []
-            for number, future in futures:
-                try:
-                    results.append(future.result())
-                except Exception as exc:
-                    failed.append(number)
-                    first_error = first_error or exc
+            outstanding = {future: number for number, future in futures}
+            was_cancelled = False
+            reason = "worker"
+            try:
+                while outstanding:
+                    # Drain already completed work before checking the stop condition.
+                    done = [future for future in outstanding if future.done()]
+                    for future in done:
+                        number = outstanding.pop(future)
+                        try:
+                            results.append(future.result())
+                        except Exception as exc:
+                            failed.append(number)
+                            first_error = first_error or exc
+                    if not outstanding:
+                        break
+                    if cancelled and cancelled():
+                        was_cancelled = True
+                        break
+                    remaining = deadline - time.monotonic() if deadline is not None else None
+                    if remaining is not None and remaining <= 0:
+                        reason = "timeout"
+                        first_error = first_error or TimeoutError("Preparation batch timed out")
+                        failed.extend(outstanding.values())
+                        break
+                    interval = remaining
+                    if cancelled is not None:
+                        interval = min(0.1, remaining) if remaining is not None else 0.1
+                    wait(outstanding, timeout=interval, return_when=FIRST_COMPLETED)
+            finally:
+                for future in outstanding:
+                    future.cancel()
             if results:
+                results.sort(key=lambda result: result[1])
                 session.merge(*(result[0] for result in results))
                 receipts = zarr.open_array(session.store, path=f"{self.path}/receipts", mode="r+")
                 blocks: dict[int, list[tuple[int, bytes]]] = {}
@@ -385,38 +446,57 @@ class Preparation:
                     receipts[start : start + len(rows), :] = rows
                 session.commit(f"Prepare {self.job}: {len(results)} tasks")
                 completed += len(results)
+            if was_cancelled:
+                raise PreparationCancelledError(repo.lookup_branch(self.branch))
             if failed:
-                raise PreparationError(failed, repo.lookup_branch(self.branch)) from first_error
+                raise PreparationError(sorted(failed), repo.lookup_branch(self.branch),
+                                       reason=reason) from first_error
         return completed
 
-    def publish(self, *, buffer_bytes: int = 128 << 20) -> Snapshot:
+    def publish(
+        self, *, buffer_bytes: int = 128 << 20, verification_workers: int = 1,
+    ) -> Snapshot:
         """Require all receipts and reread/hash each output core before marking complete.
 
         Returns an immutable revision protected by a durable output reference. Its input
         reference is retained too for reproducibility. The owning application explicitly
         releases these references when neither the dataset nor its evidence needs them.
+        Verification threads share the planned buffer allowance equally. Native/runtime
+        overhead is not an RSS cap; each thread admits one output partition at a time.
         """
         import zarr
 
+        buffer_bytes, verification_workers = index(buffer_bytes), index(verification_workers)
+        if min(buffer_bytes, verification_workers) < 1:
+            raise ValueError("Verification workers and buffer budget must be positive")
+        workers = min(verification_workers, self.grid.count)
+        per_worker = buffer_bytes // workers
+        if per_worker < 1:
+            raise MemoryError("Publication verification exceeds planned buffer budget")
         self._check_writes()
         repo = _writable_repository(self.location)
         session = repo.writable_session(self.branch)
         receipts = self._receipts(session)
-        output = SnapshotReadSession(
-            Snapshot(self.location, session.snapshot_id), buffer_bytes=buffer_bytes
-        ).open(self.config["output"])
-        for start in range(0, self.grid.count, 1024):
-            rows = np.asarray(receipts[start : start + 1024, :])
-            for offset, row in enumerate(rows):
-                number = start + offset
-                if row[0] != 1:
-                    raise ValueError(f"Preparation incomplete: task {number} has no receipt")
-                selection = self.grid.partition(number).output
-                plan = output.plan(selection)
-                if plan.buffer_bytes_upper_bound + plan.output_bytes > buffer_bytes:
-                    raise MemoryError("Publication verification exceeds planned buffer budget")
-                if _digest(output.read(selection)) != row[1:].tobytes():
-                    raise ValueError(f"Output digest mismatch for task {number}")
+        snapshot = Snapshot(self.location, session.snapshot_id)
+        context = ThreadPoolExecutor(workers) if workers > 1 else nullcontext(None)
+        with context as executor:
+            for start in range(0, self.grid.count, 1024):
+                rows = np.asarray(receipts[start : start + 1024, :])
+                for batch_start in range(0, len(rows), workers):
+                    futures = []
+                    for offset in range(batch_start, min(batch_start + workers, len(rows))):
+                        number, row = start + offset, rows[offset]
+                        if row[0] != 1:
+                            raise ValueError(
+                                f"Preparation incomplete: task {number} has no receipt")
+                        args = (snapshot, self.config["output"], self.grid.partition(number),
+                                row[1:].tobytes(), per_worker)
+                        if executor is None:
+                            _verify_partition(*args)
+                        else:
+                            futures.append(executor.submit(_verify_partition, *args))
+                    for future in futures:
+                        future.result()
         group = zarr.open_group(session.store, path=self.path, mode="a")
         if group.attrs["state"] == "complete":
             published = Snapshot(self.location, session.snapshot_id)
