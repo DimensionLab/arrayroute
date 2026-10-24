@@ -4,7 +4,8 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from arrayroute.difference import BLOCK_ELEMENTS, _regions, compare_array_readers
+from arrayroute.difference import BLOCK_ELEMENTS, compare_array_readers
+from arrayroute.ordered import flat_regions
 from arrayroute.plan import ArraySpec
 from arrayroute.reader import ArrayReader
 
@@ -32,7 +33,7 @@ def test_flat_regions_preserve_exact_c_order(shape):
     for start, stop in [(0, values.size), (1, values.size - 1), (3, 9)]:
         if stop < start or stop > values.size:
             continue
-        pieces = [values[s].reshape(-1) for s in _regions(shape, start, stop)]
+        pieces = [values[s].reshape(-1) for s in flat_regions(shape, start, stop)]
         actual = np.concatenate(pieces) if pieces else np.array([], dtype=values.dtype)
         np.testing.assert_array_equal(actual, values.reshape(-1)[start:stop])
 

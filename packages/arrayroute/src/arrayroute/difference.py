@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from collections.abc import Callable
 from typing import Any
 
 import numpy as np
 
+from .ordered import OrderedSelection, read_flat
 from .plan import Selection
 from .reader import ArrayReader, ReadStats
 from .statistics import CanonicalChannelMoments
@@ -17,71 +17,6 @@ BLOCK_ELEMENTS = 65536
 ALGORITHM = 'c-order-difference-65536-v1'
 
 
-def _regions(shape: tuple[int, ...], start: int, stop: int,
-             prefix: tuple = ()) -> Iterator[tuple]:
-    """Cover a flat C-order interval with disjoint rectangular selections."""
-    if not shape:
-        if stop > start:
-            yield prefix
-        return
-    width = math.prod(shape[1:])
-    while start < stop:
-        row, offset = divmod(start, width)
-        if offset == 0 and stop - start >= width:
-            rows = (stop - start) // width
-            yield (*prefix, slice(row, row + rows), *(slice(None) for _ in shape[1:]))
-            start += rows * width
-        else:
-            end = min(width, offset + stop - start)
-            yield from _regions(shape[1:], offset, end, (*prefix, row))
-            start += end - offset
-
-
-@dataclass(frozen=True)
-class _Source:
-    reader: ArrayReader
-    selection: Selection
-    shape: tuple[int, ...]
-    explicit: bool
-
-    @classmethod
-    def create(cls, reader: ArrayReader, selection: Selection | None) -> _Source:
-        request = reader.plan(selection if selection is not None else
-                              (slice(None),) * len(reader.backend.spec.shape))
-        return cls(reader, request.selection, request.output_shape, selection is not None)
-
-    def map_region(self, region: Selection) -> Selection:
-        indices = iter(region)
-        mapped: list[int | slice] = []
-        for source in self.selection:
-            if isinstance(source, int):
-                mapped.append(source)
-                continue
-            local = next(indices)
-            if isinstance(local, int):
-                mapped.append(source.start + local * source.step)
-            else:
-                length = len(range(source.start, source.stop, source.step))
-                start, stop, step = local.indices(length)
-                mapped.append(slice(source.start + start * source.step,
-                                    min(source.stop, source.start + stop * source.step),
-                                    source.step * step))
-        return tuple(mapped)
-
-
-def _block(source: _Source, start: int, stop: int, stats: ReadStats,
-           cancelled: Callable[[], bool] | None) -> np.ndarray:
-    reader = source.reader
-    out = np.empty(stop - start, dtype=reader.backend.dtype)
-    offset = 0
-    for selection in _regions(source.shape, start, stop):
-        if cancelled is not None and cancelled():
-            raise InterruptedError('Array comparison cancelled')
-        values = reader.read(source.map_region(selection), stats=stats)
-        out[offset:offset + values.size] = values.reshape(-1)
-        offset += values.size
-        del values
-    return out
 
 
 class _Summary:
@@ -170,7 +105,7 @@ def compare_array_readers(
     if ((before is None and before_selection is not None)
             or (after is None and after_selection is not None)):
         raise ValueError('A selection requires its source array')
-    sources = [_Source.create(r, s) for r, s in
+    sources = [OrderedSelection.create(r, s) for r, s in
                ((before, before_selection), (after, after_selection)) if r is not None]
     readers = [s.reader for s in sources]
     counts = [math.prod(s.shape) for s in sources]
@@ -195,7 +130,7 @@ def compare_array_readers(
         r.buffer_bytes // (2*r.backend.dtype.itemsize*BLOCK_ELEMENTS) for r in readers
     )))
     for batch_start in range(0, max(counts), batch_elements):
-        batches = [(_block(s, batch_start, min(c, batch_start + batch_elements),
+        batches = [(read_flat(s, batch_start, min(c, batch_start + batch_elements),
                            stats[i], cancelled)
                     if batch_start < c else None)
                    for i, (s, c) in enumerate(zip(sources, counts, strict=True))]

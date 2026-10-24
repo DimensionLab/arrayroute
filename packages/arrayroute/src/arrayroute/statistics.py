@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 
 
@@ -250,3 +252,31 @@ class CanonicalChannelMoments:
     def mean_square(self) -> np.ndarray:
         moments = self.snapshot()
         return moments.variance + moments.mean**2
+
+
+class CompensatedSum:
+    """Neumaier sum of scalar partials; callers must pin their partition and input order.
+
+    Unlike CanonicalChannelMoments this does not select canonical leaves. Infinite
+    partials propagate using IEEE addition without contaminating the compensation term.
+    """
+
+    def __init__(self) -> None:
+        self.total = 0.0
+        self.correction = 0.0
+
+    def add(self, value: float) -> None:
+        combined = self.total + value
+        if math.isfinite(combined):
+            self.correction += (
+                (self.total - combined) + value
+                if abs(self.total) >= abs(value)
+                else (value - combined) + self.total
+            )
+        else:
+            self.correction = 0.0
+        self.total = combined
+
+    @property
+    def value(self) -> float:
+        return self.total + self.correction

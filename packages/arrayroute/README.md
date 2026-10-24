@@ -63,6 +63,24 @@ this mechanism. Reads after a completed external write create fresh indexes. Con
 source mutation still requires snapshot isolation supplied by the caller. An outer
 shard codec uses whole-shard accounting and the ordinary subset reader.
 
+`arrayroute.ordered.update_digest(digest, reader, selection=None)` appends the exact
+C-order bytes of a selection to a hashlib digest in bounded intervals. It preserves the
+stored dtype, endianness, signed zeros and NaN payloads. Changing read intervals or storage
+layout does not change this byte stream. Hash shape, dtype, dimensions and units separately
+when constructing a complete scientific identity; equal payload bytes alone do not capture
+them. `block_elements` limits the additional ordered-result buffer (default 65536 elements),
+clamped to the reader allowance. Reader buffers and backend scratch remain additional.
+Cancellation is checked between rectangular reads; cancellation leaves the caller's digest
+partially updated, so discard that digest or restart from an independently saved state.
+`OrderedSelection` and `read_flat` expose the same ordered interval reads for fixed-partition
+reductions. `NumpyBackend` adapts an already-resident array without allocating a copy at
+construction; its backing array must remain unchanged while a read is in progress.
+
+`arrayroute.statistics.CompensatedSum` folds scalar partials using Neumaier compensation.
+It does not define the partials or their order. Callers requiring reproducibility must fix
+both and record their numerical environment; compensation alone is not a cross-device
+reproducibility guarantee.
+
 `arrayroute.statistics.ChannelMoments` accumulates or merges channel-last population
 statistics from bounded buffers, with optional per-channel validity masks. It keeps integer
 counts and centred float64 moments; missing observations do not contaminate the result.

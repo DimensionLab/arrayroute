@@ -15,6 +15,25 @@ if TYPE_CHECKING:
     from .reader import Backend
 
 
+class NumpyBackend:
+    """Borrow an in-memory array; report native contiguous slice reads without decoding."""
+
+    def __init__(self, array: np.ndarray):
+        self.array = array
+        self.dtype = array.dtype
+        if self.dtype.hasobject or not array.ndim:
+            raise TypeError("Expected a non-scalar fixed-size NumPy array")
+        self.spec = ArraySpec(
+            tuple(array.shape),
+            tuple(max(1, n) for n in array.shape),
+            self.dtype.itemsize,
+            contiguous=True,
+        )
+
+    def read(self, selection: Selection) -> np.ndarray:
+        return np.asarray(self.array[selection]).copy(order="C")
+
+
 class DenseGatherBackend:
     """Opt into native bounding-box reads when the plan permits their live buffers."""
 
