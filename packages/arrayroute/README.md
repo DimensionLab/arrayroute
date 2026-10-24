@@ -1857,3 +1857,29 @@ The TensorStore cache is a soft limit separate from reader buffers; immutable mo
 caller assertion that values stay unchanged, not snapshot isolation. Other engines reject
 a nonzero TensorStore cache allowance. Native cache hit/miss counts are not inferred from
 ArrayRoute's conservative planned decode-byte statistics.
+
+### Overlap hashing with numerical work
+
+`arrayroute.hashing.DigestPipeline` updates caller-owned hashlib digests in submission
+order on one worker while the producer continues other processing. It copies each submitted
+contiguous buffer before returning, so that buffer can be reused immediately. At most one
+immutable payload is retained; the next submission waits for completion. Use it as a context
+manager and inspect digests only after a successful `flush()` or context exit.
+
+```python
+import hashlib
+from arrayroute.hashing import DigestPipeline
+
+checksum = hashlib.sha256()
+with DigestPipeline(buffer_bytes=16 << 20) as hashing:
+    for block in blocks:  # each contiguous block must fit the allowance
+        hashing.update(checksum, block)
+        process(block)
+print(checksum.hexdigest())
+```
+
+Byte order and the selected hash algorithm are unchanged. The allowance covers the copied
+payload, in addition to producer buffers, numerical scratch, digest state and thread overhead;
+it is not a process RSS limit. Updates have one producer and no retries. Worker failures
+propagate; discard affected digests after any error. Context exit joins active work and
+preserves a producer exception. Native hashing cannot be interrupted mid-call.
