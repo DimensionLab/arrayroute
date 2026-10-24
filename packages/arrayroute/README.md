@@ -68,8 +68,9 @@ C-order bytes of a selection to a hashlib digest in bounded intervals. It preser
 stored dtype, endianness, signed zeros and NaN payloads. Changing read intervals or storage
 layout does not change this byte stream. Hash shape, dtype, dimensions and units separately
 when constructing a complete scientific identity; equal payload bytes alone do not capture
-them. `block_elements` limits the additional ordered-result buffer (default 65536 elements),
-clamped to the reader allowance. Reader buffers and backend scratch remain additional.
+them. `block_elements` limits the additional ordered-result buffer. By default it uses at
+most 1,048,576 elements and half the reader allowance, aligned with trailing dimensions.
+Reader buffers and backend scratch remain additional.
 Cancellation is checked between rectangular reads; cancellation leaves the caller's digest
 partially updated, so discard that digest or restart from an independently saved state.
 `OrderedSelection` and `read_flat` expose the same ordered interval reads for fixed-partition
@@ -2209,3 +2210,29 @@ approximation has absolute error at most 1.5e-7, contributing at most approximat
 `abs(reference - mean) * 1.5e-7` to CRPS error, plus floating-point roundoff. Zero spread
 uses absolute error for CRPS. Undefined ratios remain NaN; nonfinite spread, RMSE and CRPS
 become infinity. Short conformal-factor vectors hold their final nonnegative finite value.
+
+## Storage-aligned processing regions
+
+`arrayroute.regions.block_regions(shape, block_shape, max_elements=..., coalesce=True)`
+partitions an array into bounded, rank-preserving rectangular selections. Whole preferred
+blocks are combined into larger batches when they fit, expanding trailing axes first.
+Oversized blocks are subdivided locally. This avoids splitting output storage chunks across
+successive writes when the working allowance can hold a whole chunk.
+
+```python
+from arrayroute.regions import block_regions
+
+for region in block_regions(source_shape, output_chunks, max_elements=working_values,
+                            coalesce=True):
+    process_and_write(region)
+```
+
+Choose `working_values` from the combined input/output/numerical workspace, and separately
+admit source decoded chunks and native caches. The iterator performs no allocation or I/O
+proportional to the array size: traversal state depends on rank. It does not reserve memory,
+own buffers, or publish outputs. Without coalescing, each region stays within one preferred
+block. All modes visit each element exactly once; ragged edges are clipped to the domain.
+
+This order is suitable for pointwise transforms whose arithmetic is independent of spatial
+batching. It is **not** global C order. Reductions requiring canonical grouping must keep
+their canonical leaves and reduction order; do not substitute this traversal for them.
