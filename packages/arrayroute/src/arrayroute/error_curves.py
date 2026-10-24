@@ -219,9 +219,10 @@ def error_curves(
             "vrmse": np.where(finite, rmse / np.sqrt(np.maximum(var_t, epsilon)), np.inf),
             "corr": np.where(finite, corr, np.nan),
             "persistence": persistence,
-            "climatology": np.sqrt(clim) / np.maximum(np.sqrt(tt), epsilon),
+            "climatology": np.where(count > 0,
+                                    np.sqrt(clim) / np.maximum(np.sqrt(tt), epsilon), np.inf),
             "ms_pred": np.where(finite, pp / denominator, np.inf),
-            "ms_true": tt / denominator,
+            "ms_true": np.where(count > 0, tt / denominator, np.nan),
             "finite": finite,
             "sigma": np.array(sigma),
         }

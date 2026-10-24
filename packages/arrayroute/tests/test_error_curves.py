@@ -81,6 +81,8 @@ def test_masks_preserve_vector_rmse_and_ignore_missing_reference():
     assert np.isinf(result["rmse"][2]) and not result["finite"][2]
     assert np.isinf(result["persistence"][1:]).all()
     assert result["sigma"] == 0
+    assert np.isinf(result["climatology"][2])
+    assert np.isnan(result["ms_true"][2])
 
 
 def test_nonfinite_prediction_scores_infinite_but_reference_fails():
@@ -109,7 +111,7 @@ def test_bad_masks_and_shapes_fail():
 
 def test_admission_and_cancellation_before_payload(monkeypatch):
     r = reader(np.ones((8, 600, 3)))
-    monkeypatch.setattr(r, "read", lambda *a, **kw: pytest.fail("payload I/O"))
+    monkeypatch.setattr(r.backend, "read", lambda *a, **kw: pytest.fail("payload I/O"))
     with pytest.raises(MemoryError):
         error_curves(r, r, buffer_bytes=100)
     with pytest.raises(InterruptedError):
