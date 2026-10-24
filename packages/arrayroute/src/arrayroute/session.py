@@ -144,7 +144,8 @@ class LocalReadSession:
             backend = TensorStoreBackend(
                 ts.open(
                     {
-                        "driver": "zarr3",
+                        "driver": "zarr" if (Path(key[0]) / key[1] / ".zarray").is_file()
+                        else "zarr3",
                         "kvstore": {"driver": "file", "path": str(Path(key[0]) / key[1]) + "/"},
                     },
                     read=True,

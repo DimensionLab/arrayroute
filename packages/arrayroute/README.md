@@ -2301,3 +2301,29 @@ block. All modes visit each element exactly once; ragged edges are clipped to th
 This order is suitable for pointwise transforms whose arithmetic is independent of spatial
 batching. It is **not** global C order. Reductions requiring canonical grouping must keep
 their canonical leaves and reduction order; do not substitute this traversal for them.
+
+## Optional tensor preprocessing
+
+Install the `torch` extra and a PyTorch build appropriate for the executor. The
+base package does not import PyTorch or initialize CUDA. Explicit CPU/CUDA
+normalization is available as:
+
+```python
+from arrayroute.torch_transforms import TorchChannelNormalizer
+
+normalize = TorchChannelNormalizer(mean=[10.0, 20.0], scale=[2.0, 4.0], device="cuda:0")
+normalized = normalize(batch, channel_axis=-1)
+provenance = normalize.describe()
+```
+
+The input must already be a float32 tensor on the requested device. The operation
+preserves the input, snapshots its statistics, and uses separate subtraction and
+division operations. It neither transfers data implicitly nor falls back to CPU.
+The caller owns CUDA stream handoff and tensor lifetime. Fixed-runtime repeatability
+is tested; byte-identical floating-point results across every GPU/compiler or
+distributed topology are not promised.
+
+`python -m arrayroute.doctor --cuda` performs a real device operation and comparison
+against NumPy. Add `--distributed --expected-nodes N` under `torchrun` to test the
+collective and reported node count. It is a runtime smoke check, not a performance
+benchmark or proof that reported nodes are distinct physical machines.

@@ -9,8 +9,9 @@ from arrayroute.session import LocalReadSession
 
 
 @pytest.mark.parametrize("engine", ["zarr-python", "tensorstore", "zarrista"])
-def test_session_reuses_evicts_and_serializes_without_native_handles(tmp_path, engine):
-    root = zarr.open_group(tmp_path, mode="w")
+@pytest.mark.parametrize("zarr_format", [2, 3])
+def test_session_reuses_evicts_and_serializes_without_native_handles(tmp_path, engine, zarr_format):
+    root = zarr.open_group(tmp_path, mode="w", zarr_format=zarr_format)
     values = np.arange(8 * 6 * 3, dtype=np.float32).reshape(8, 6, 3)
     for name, offset in [("a", 0), ("b", 1000)]:
         root.create_array(name, data=values + offset, chunks=(2, 3, 3))

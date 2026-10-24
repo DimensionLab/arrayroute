@@ -137,9 +137,13 @@ class TensorStoreBackend:
 class ZarristaBackend:
     def __init__(self, array: Any):
         self.array = array
-        self.dtype = np.dtype(array.metadata["data_type"])
+        metadata = array.metadata
+        self.dtype = np.dtype(metadata["dtype"] if metadata.get("zarr_format") == 2
+                              else metadata["data_type"])
+        if self.dtype.hasobject or self.dtype.itemsize == 0:
+            raise TypeError("A fixed-size, non-object dtype is required")
         chunks = array.effective_subchunk_shape or array.chunk_shape([0] * array.ndim)
-        codecs = array.metadata["codecs"]
+        codecs = metadata.get("codecs", [])
         outer_codec = len(codecs) != 1 and any(
             (c if isinstance(c, str) else c["name"]) == "sharding_indexed" for c in codecs
         )
