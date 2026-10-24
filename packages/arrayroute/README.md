@@ -1921,3 +1921,38 @@ linear interpolation, with a finite convex interpolation when subtracting two ex
 finite endpoints would overflow. Cancellation is checked between reads and numerical
 blocks; it cannot interrupt native calls. `count_nonfinite` provides a cheaper one-pass,
 no-conversion count of NaNs and infinities when moments/percentiles are unnecessary.
+
+### Lazy vector magnitudes
+
+`arrayroute.derived.VectorMagnitudeBackend` exposes a channel-last vector array as scalar
+float64 magnitudes without creating a full derived dataset. Wrap it in an `ArrayReader`:
+
+```python
+from arrayroute.derived import VectorMagnitudeBackend
+from arrayroute.reader import ArrayReader, ReadStats
+from arrayroute.quantiles import finite_statistics
+
+source_io = ReadStats()
+magnitudes = ArrayReader(
+    VectorMagnitudeBackend(source_reader, workspace_bytes=8 << 20, source_stats=source_io),
+    buffer_bytes=8 << 20,
+)
+summary = finite_statistics(magnitudes, quantiles=(0.99,), workspace_bytes=32 << 20)
+```
+
+The source reader bounds I/O; the transform workspace covers each native input block,
+float64 conversion and block result; the outer reader bounds the derived output. Their
+allowances and native caches are additional, not one global RSS cap. The source is borrowed,
+not closed. Source I/O counts go to `source_stats`; outer statistics describe derived
+requests and are not physical storage counters. Do not attach the same shared pool to both
+readers: nested reservations are rejected. Independent pools may be used with their combined
+allowances explicitly accounted for.
+
+Float64 sources use channel-order `hypot` to avoid overflow/underflow from squaring.
+For smaller real floats and integers/bools, the full finite range can safely be squared
+and summed in float64, so the adapter uses that faster reduction without a large temporary.
+The selected reduction is exposed as `reduction`. NaN components propagate in both paths.
+Results can differ in last bits across source dtypes; pin dtype, runtime and input revision
+for exact replay. The final component axis is removed; selections retain source order.
+Cancellation occurs between native reads and numerical blocks. Hashing this derived reader
+checks magnitude bytes only, not the original vector directions, units or source metadata.
