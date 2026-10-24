@@ -100,3 +100,13 @@ def test_recursive_shared_budget_reservation_rejected_before_deadlock():
     for backend in [MeanBackend([source]), StackBackend([mean]), VectorMagnitudeBackend(mean)]:
         with pytest.raises(ValueError, match="shared read pool"):
             ArrayReader(backend, shared_budget=pool)
+
+
+def test_stack_copy_workspace_does_not_use_mean_scratch_estimate():
+    values = [np.arange(3 * 8 * 16, dtype="f4").reshape(3, 8, 16) + i for i in range(3)]
+    sources = [ArrayReader(NumpyBackend(v), buffer_bytes=8192) for v in values]
+    backend = StackBackend(sources, workspace_bytes=4096)
+    actual = ArrayReader(backend).read((slice(None),) * 4)
+    assert actual.tobytes() == np.stack(values).tobytes()
+    assert backend.source_stats.requests == 3
+    assert backend.source_stats.output_bytes == actual.nbytes

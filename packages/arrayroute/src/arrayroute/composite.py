@@ -86,6 +86,11 @@ class StackBackend(_Sources):
         )
         first = self.sources[0].backend
         self.dtype = first.dtype
+        # Stacking copies native values; it needs no compensated-mean numerical scratch.
+        self.block_elements = min(
+            workspace_bytes // self.dtype.itemsize,
+            *(r.buffer_bytes // (2 * self.dtype.itemsize) for r in self.sources),
+        )
         shape = (len(sources), *first.spec.shape)
         self.spec = ArraySpec(
             shape, tuple(max(1, n) for n in shape), self.dtype.itemsize, contiguous=True

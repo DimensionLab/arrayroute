@@ -2146,3 +2146,30 @@ This reduces repeated storage calls while preserving the selected value order.
 Its byte stream, including native endianness and NaN payloads, is unchanged. Hash output
 scratch is additional to the source reader's allowance. This batching policy does not
 change the mean or magnitude algorithm identifiers.
+
+## Aligned sequence batches
+
+`arrayroute.axis_batches.aligned_axis_batches` reads consecutive matching steps from
+multiple readers whose sequence axes can occupy different positions. It validates common
+sequence lengths, allows a prefix, and sizes each batch from retained input bytes plus an
+explicit consumer workspace estimate per step.
+
+```python
+from arrayroute.axis_batches import aligned_axis_batches
+
+for batch in aligned_axis_batches(
+    [(ensemble_reader, 1), (reference_reader, 0)],
+    buffer_bytes=64 << 20,
+    workspace_bytes_per_step=workspace_per_frame,
+    steps=100,
+):
+    consume(batch.start, batch.stop, batch.values)
+    del batch
+```
+
+Release each batch before advancing. Reader I/O allowances, backend caches/codec scratch,
+retained consumer results and independently running consumers are additional to this
+allowance. A single complete sequence step must fit; this helper does not spatially tile
+oversized frames. Sources remain immutable and caller-owned. Shared reader pools admit
+I/O, not retained consumer arrays. Cancellation is checked between reads. Consumers own
+numerical reduction order; batching by itself does not guarantee deterministic arithmetic.
