@@ -2012,3 +2012,43 @@ at the smaller of the source allowance and the larger of the transform workspace
 one selected row's planned read footprint. A large source chunk may therefore exceed
 the transform workspace. This limits concurrent decoding for widely spaced selections;
 it does not limit persistent backend caches or make the workspace a total RSS cap.
+
+## Deterministic artifact archives
+
+`arrayroute.archive.pack_directory` packages an immutable local data tree as an ordinary
+uncompressed POSIX pax tar, usable independently of Frontier:
+
+```python
+from arrayroute.archive import pack_directory
+
+receipt = pack_directory(
+    "prediction.zarr", "prediction.tar", archive_name="prediction.zarr",
+    max_output_bytes=1 << 40, buffer_bytes=1 << 20,
+)
+print(receipt.sha256, receipt.archive_bytes, receipt.payload_bytes)
+```
+
+Identical relative paths and file bytes produce identical archive bytes. Ordering is
+lexical depth-first; time/owner metadata is zeroed, names of owners are empty, directories
+use mode 0755 and files 0644. Encoded array chunks and their metadata remain byte-identical.
+Source permissions, xattrs, hardlink identity and sparse extents are not retained. Empty
+directories are included. Symlinks and special files are rejected.
+
+Copy and output buffers together fit `buffer_bytes`. No full member index is retained.
+Traversal separately limits pending names across all levels (`max_pending_names=65536`),
+logical members (`max_members=10000000`), depth (`max_depth=64`) and UTF-8 path bytes
+(`max_path_bytes=4096`). Python name objects, header encoding and OS caches are additional
+memory. `max_output_bytes` covers the complete tar, including headers and padding.
+
+By default publication refuses an existing destination, including a concurrent creator.
+`replace=True` atomically replaces an existing archive only after the new file is complete
+and fsynced. Handled failures and cancellation preserve the prior destination and remove
+staging. A killed process may leave a hidden `.arrayroute-*.partial` file; power-loss
+recovery is not provided. Publication requires same-directory hard-link support when not
+replacing. `cancelled` is checked per entry and copy block, not inside blocking OS calls.
+
+The source tree must stay immutable and both filesystem parents must be trusted. Observed
+size, identity, mode or timestamp changes fail. These checks do not create a point-in-time
+filesystem snapshot or defend against hostile concurrent parent-directory replacement.
+SHA-256 identifies archive bytes; it is not authentication. This is a transfer artifact,
+not a random-access replacement for Zarr or other scientific storage backends.
