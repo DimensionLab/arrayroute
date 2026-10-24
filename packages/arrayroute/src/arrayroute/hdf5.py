@@ -35,6 +35,8 @@ class HDF5Backend:
             raise TypeError(
                 "HDF5 reads require fixed-size dtypes; variable-length/references rejected"
             )
+        if self.dtype.subdtype is not None:
+            raise TypeError("HDF5 array-valued dtypes require explicit dimension expansion")
         if dataset.shape is None or not dataset.shape:
             raise ValueError("HDF5 reads require a non-null array with at least one dimension")
         layout = dataset.id.get_create_plist().get_layout()

@@ -197,3 +197,15 @@ def test_unsupported_shapes_and_types(tmp_path):
             s.open("references")
         with pytest.raises(ValueError, match="same number"):
             s.read_columns(columns=["short", "long"])
+
+
+def test_array_valued_dtype_rejected_before_payload(tmp_path, monkeypatch):
+    path = tmp_path / "array-dtype.h5"
+    with h5py.File(path, "w") as f:
+        f.create_dataset("x", shape=(20,), dtype=np.dtype(("f4", (3,))))
+    def forbidden(*args):
+        pytest.fail("Array-valued dtype reached payload reading")
+    monkeypatch.setattr(HDF5Backend, "read", forbidden)
+    with HDF5ReadSession(path) as s:
+        with pytest.raises(TypeError, match="dimension expansion"):
+            s.read_columns()

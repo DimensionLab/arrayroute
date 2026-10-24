@@ -254,7 +254,8 @@ retention are additional memory. The HDF5 raw chunk cache is disabled.
 
 Column projection admits only requested one-dimensional columns and preserves their order.
 Inspection streams finite counts and extrema, retaining native integer precision. Fixed-size
-strings may be inspected as numbers; variable-length strings, references, null/scalar arrays,
+strings may be inspected as numbers; variable-length strings, references, array-valued dtypes,
+null/scalar arrays,
 compact datasets, virtual datasets, external raw storage and soft/external links are rejected.
 This embedded-data policy is not a sandbox for native HDF5 code or third-party filters.
 
