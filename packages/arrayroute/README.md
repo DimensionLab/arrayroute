@@ -1783,3 +1783,23 @@ materializing the full region. Regions may have different origins or source shap
 selected shape and dtype must agree for paired metrics. The report retains both source
 shapes and normalized selections, and uses `comparison_scope="full_selection"` when a
 selection was supplied. Original chunk admission still applies to every mapped read.
+
+
+### Publishing a complete local directory
+
+```python
+from arrayroute.publication import staged_directory
+
+with staged_directory("prepared-dataset", cancelled=should_stop) as staging:
+    write_dataset(staging)
+    validate_dataset(staging)
+# prepared-dataset becomes visible only after successful context exit.
+```
+
+The staging directory retains the destination's basename. Publication uses an exclusive
+rename on supported local filesystems; an existing destination, including an empty directory
+or dangling symlink, is never replaced. Handled exceptions and late cancellation remove
+staging. Unsupported exclusive rename fails explicitly. This is atomic visibility, not
+power-loss durability or resumable conversion. Close all writers before context exit; keep
+the parent directory trusted and stable. Abrupt process termination can leave a hidden
+`.arrayroute-*.partial` container for explicit cleanup. No dataset payload copy is added.
