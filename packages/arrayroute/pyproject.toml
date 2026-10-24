@@ -1,6 +1,6 @@
 [project]
 name = "arrayroute"
-version = "0.1.66"
+version = "0.1.67"
 description = "Measured, bounded selections over scientific chunked arrays"
 requires-python = ">=3.11"
 license = "Apache-2.0"

@@ -22,7 +22,7 @@ def object_server(tmp_path):
     legacy = zarr.open_group(tmp_path / "v2", mode="w", zarr_format=2)
     legacy.create_array("velocity", data=values, chunks=(1, 16, 16, 16))
     files = {
-        "/data/" + str(p.relative_to(tmp_path)): p.read_bytes()
+        "/data/" + p.relative_to(tmp_path).as_posix(): p.read_bytes()
         for p in tmp_path.rglob("*")
         if p.is_file()
     }

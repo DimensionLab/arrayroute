@@ -5,10 +5,28 @@ import shutil
 import tarfile
 import threading
 from contextlib import contextmanager
+from types import SimpleNamespace
 
 import pytest
 
 from arrayroute.archive import pack_directory
+
+
+@pytest.mark.parametrize("platform", ["nt", "posix"])
+def test_cross_api_identity_preserves_file_and_modification_checks(monkeypatch, platform):
+    import arrayroute.archive as archive
+
+    monkeypatch.setattr(archive, "os", SimpleNamespace(name=platform))
+    fields = dict(st_dev=1, st_ino=2, st_mode=0o100644, st_size=4,
+                  st_mtime_ns=5, st_ctime_ns=6)
+    before = SimpleNamespace(**fields)
+    assert archive._opened_matches_path(before, before)
+    different_ctime = SimpleNamespace(**{**fields, "st_ctime_ns": 7})
+    assert archive._opened_matches_path(before, different_ctime) == (platform == "nt")
+    for key in ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns"):
+        changed = SimpleNamespace(**{**fields, key: fields[key] + 1})
+        assert not archive._opened_matches_path(before, changed)
+    assert archive._identity(before) != archive._identity(different_ctime)
 
 
 def tree(root):

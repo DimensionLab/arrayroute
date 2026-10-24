@@ -504,6 +504,10 @@ size, not a previously measured throughput claim. All supported read engines can
 the same array. Receipts record the selected layouts and actual writer concurrency.
 Invalid or duplicate layout choices fail before creating the output directory.
 
+Fixture receipts distinguish file lengths from filesystem-allocated blocks.
+`allocated_file_bytes` is `null` when the OS does not expose `st_blocks` (including
+Windows); it is never substituted with logical array size or file length.
+
 The generator saves `materialization.json` before counting physical files. For very
 large fixtures, numerical verification can proceed independently of that inventory:
 
@@ -1736,8 +1740,10 @@ Recording is optional, process-local and bounded (100,000 events by default,
 1,000,000 maximum). Failed or truncated captures cannot be analyzed as complete
 pilots. Concurrent callers are captured in invocation order but receive no policy
 recommendation: serial replay cannot predict publication or single-flight behavior.
-Take a snapshot after outstanding reads finish. Saved JSON uses private permissions,
-bounded input size and atomic no-overwrite publication; it contains no executable
+Take a snapshot after outstanding reads finish. Saved JSON uses POSIX mode 0600;
+on Windows, access follows the destination directory's inherited ACL. Choose an
+access-restricted directory for sensitive traces. Files use bounded input size
+and atomic no-overwrite publication; they contain no executable
 factories. The recorder and analysis require only ArrayRoute's base dependencies.
 
 ## Ordered frame batches

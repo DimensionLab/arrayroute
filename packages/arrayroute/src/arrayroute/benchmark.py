@@ -126,13 +126,16 @@ def create_fixture(
     # Numeric verification must not wait for a multi-million-object inventory.
     (root / "materialization.json").write_text(json.dumps(receipt, indent=2))
     for name, array in arrays.items():
-        file_count, file_bytes, allocated_bytes = 0, 0, 0
+        file_count, file_bytes = 0, 0
+        allocated_bytes: int | None = 0
         for directory, _, names in os.walk(root / f"{name}.zarr"):
             for filename in names:
                 file_count += 1
                 stat = (Path(directory) / filename).stat()
                 file_bytes += stat.st_size
-                allocated_bytes += stat.st_blocks * 512
+                blocks = getattr(stat, "st_blocks", None)
+                allocated_bytes = (allocated_bytes + blocks * 512
+                                   if blocks is not None and allocated_bytes is not None else None)
         receipt["layouts"][name] = {
             "chunks": array.chunks,
             "shards": array.shards,

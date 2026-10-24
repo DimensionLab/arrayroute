@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import hashlib
 import json
+import os
 import random
 import stat
 import subprocess
@@ -54,7 +55,8 @@ def test_real_reads_normalize_identity_preserve_endian_and_do_not_store_values(t
     path = tmp_path / 'access.json'
     recorder.snapshot().save(path)
     assert identity not in path.read_text() and 'pressure' not in path.read_text()
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    if os.name == "posix":
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert AccessTrace.load(path) == recorder.snapshot()
     before = path.read_bytes()
     with pytest.raises(FileExistsError):

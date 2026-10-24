@@ -76,7 +76,8 @@ class CatalogPage:
 
 
 def _publish_snapshot(temporary: Path, target: Path, count: int, identity: str) -> CatalogReceipt:
-    with temporary.open("rb") as stream:
+    # Windows FlushFileBuffers requires a writable handle, even after SQLite closes.
+    with temporary.open("r+b") as stream:
         os.fsync(stream.fileno())
         file_hash = hashlib.file_digest(stream, "sha256").hexdigest()
     size = temporary.stat().st_size

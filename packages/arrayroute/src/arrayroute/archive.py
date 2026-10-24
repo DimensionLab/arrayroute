@@ -28,6 +28,13 @@ def _identity(value: os.stat_result) -> tuple[int, ...]:
             value.st_mtime_ns, value.st_ctime_ns)
 
 
+def _opened_matches_path(before: os.stat_result, opened: os.stat_result) -> bool:
+    # CPython on Windows reports birth time via stat but change time via fstat.
+    # Compare ctime only within the same API; retain both before/after checks.
+    left, right = _identity(before), _identity(opened)
+    return left[:-1] == right[:-1] if os.name == "nt" else left == right
+
+
 def _positive(value: int, name: str) -> int:
     if isinstance(value, bool) or operator.index(value) < 1:
         raise ValueError(f"{name} must be a positive integer")
@@ -154,9 +161,11 @@ def pack_directory(
                 else:
                     flags = (
                         os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+                        | getattr(os, "O_BINARY", 0)
                     )
                     with os.fdopen(os.open(path, flags), "rb", buffering=0) as stream:
-                        if _identity(os.fstat(stream.fileno())) != _identity(before):
+                        opened = os.fstat(stream.fileno())
+                        if not _opened_matches_path(before, opened):
                             raise OSError("Archive source changed before reading")
                         remaining = before.st_size
                         while remaining:
@@ -167,7 +176,7 @@ def pack_directory(
                                 raise OSError("Archive source was truncated")
                             emit(view[:count])
                             remaining -= count
-                        if _identity(os.fstat(stream.fileno())) != _identity(before):
+                        if _identity(os.fstat(stream.fileno())) != _identity(opened):
                             raise OSError("Archive source changed while reading")
                     payload += before.st_size
                     emit(b"\0" * (padded_size - before.st_size))
