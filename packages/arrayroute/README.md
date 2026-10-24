@@ -2096,3 +2096,13 @@ Callers must separately budget simultaneous reductions; a reader's shared I/O po
 reserve the numerical workspace. Cancellation is checked between reads and reductions,
 not inside blocking backend calls. Reduced memory does not imply faster full-volume scoring:
 keep a direct-engine baseline for the actual workload.
+
+Use `steps=100` to score a prefix without reading later frames. With `diagnostics=True`
+and no mask, the same pass also returns temporal mean/std squared differences and reference
+norms, mean temporal standard deviations, global prediction standard deviation, and
+`probes_prediction` / `probes_reference`. Probes contain up to `probes=64` evenly spaced
+spatial points (all components) followed by the per-frame spatial means. Set `probes=0`
+for spatial means only. Probe state and output are admitted against the numerical allowance.
+Record `DIAGNOSTIC_ALGORITHM` alongside these results. `finite` must be checked before
+interpreting diagnostics for nonfinite predictions. `exact_copy` compares original source
+values before float64 conversion; it is value equality, not a source-file fingerprint.

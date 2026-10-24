@@ -8,6 +8,8 @@ from collections.abc import Callable, Iterator
 
 import numpy as np
 
+from ._temporal_diagnostics import DIAGNOSTIC_ALGORITHM as DIAGNOSTIC_ALGORITHM
+from ._temporal_diagnostics import TemporalDiagnostics
 from .plan import Selection
 from .reader import ArrayReader, ReadStats
 
@@ -35,6 +37,7 @@ def _regions(shape: tuple[int, ...], max_points: int = 256) -> Iterator[Selectio
 def error_curves(
     prediction: ArrayReader, reference: ArrayReader, *, validity: ArrayReader | None = None,
     buffer_bytes: int = 128 << 20, epsilon: float = 1e-12,
+    steps: int | None = None, diagnostics: bool = False, probes: int = 64,
     cancelled: Callable[[], bool] | None = None, stats: ReadStats | None = None,
 ) -> dict[str, np.ndarray]:
     """Score immutable (time, spatial..., component) arrays without whole-time columns.
@@ -50,6 +53,13 @@ def error_curves(
     reader budgets cover I/O only; concurrent scorers need separate numerical budgets.
     Cancellation is polled between operations, not inside a blocking backend read.
     No cross-platform bit identity or identity to monolithic reductions is promised.
+
+    ``steps`` scores only a nonempty prefix. ``diagnostics`` adds fixed-domain temporal
+    mean/std differences and evenly spaced point probes (plus spatial means), using
+    DIAGNOSTIC_ALGORITHM. Probe state/output is O(time * probes * components) and is
+    admitted before reading payloads. Diagnostics reject masks; when predictions are
+    nonfinite, consult ``finite`` before interpreting their sanitized diagnostic values.
+    ``exact_copy`` compares the original values, before float64 arithmetic conversion.
     """
     if isinstance(buffer_bytes, bool) or not isinstance(buffer_bytes, int) or buffer_bytes < 1:
         raise ValueError("buffer_bytes must be a positive integer")
@@ -62,9 +72,21 @@ def error_curves(
     if any(r.backend.spec.shape != shape or r.backend.dtype.kind not in "fiub"
            for r in readers):
         raise ValueError("Readers must have matching real numeric shapes")
+    if steps is not None:
+        if isinstance(steps, bool) or not isinstance(steps, int) or not 1 <= steps <= shape[0]:
+            raise ValueError("steps must select a nonempty prefix of the rollout")
+        shape = (steps, *shape[1:])
+    if not isinstance(diagnostics, bool):
+        raise ValueError("diagnostics must be boolean")
+    if isinstance(probes, bool) or not isinstance(probes, int) or not 0 <= probes <= 1024:
+        raise ValueError("probes must be an integer between zero and 1024")
+    if diagnostics and validity is not None:
+        raise ValueError("Temporal diagnostics require a fixed fully observed domain")
     n, channels = shape[0], shape[-1]
     frames = min(n, _TIME_BLOCK)
     state_bytes = n * (12 * channels + 40) * 8
+    if diagnostics:
+        state_bytes += n * min(math.prod(shape[1:-1]), probes) * channels * 32
     workspace_bytes = frames * min(math.prod(shape[1:-1]), 256) * channels * 160
     remaining = buffer_bytes - state_bytes - workspace_bytes
     if remaining <= 0:
@@ -72,7 +94,9 @@ def error_curves(
     read_allowance = remaining // 2
     readers = [ArrayReader(r.backend, buffer_bytes=min(r.buffer_bytes, read_allowance),
                            shared_budget=r.shared_budget) for r in readers]
-    per_point = channels * (frames * sum(r.backend.dtype.itemsize for r in readers) + 64)
+    per_point = channels * (
+        frames * sum(r.backend.dtype.itemsize for r in readers) + (128 if diagnostics else 64)
+    )
     max_points = min(read_allowance // per_point, *(
         r.buffer_bytes // (2 * frames * channels * r.backend.dtype.itemsize) for r in readers))
     if max_points < min(math.prod(shape[1:-1]), 256):
@@ -102,6 +126,9 @@ def error_curves(
     se, tt, pp, clim, pers, pers_tt, common_count = (np.zeros(n) for _ in range(7))
     var_t, var_p, cov = np.zeros(n), np.zeros(n), np.zeros(n)
     finite = np.ones(n, bool)
+    exact = True
+    diagnostic = TemporalDiagnostics(shape, probes) if diagnostics else None
+    window_offset = 0
     for window in _regions(shape, max_points):
         climate_sum = climate_count = first_t = first_mask = None
         for start in range(0, n, frames):
@@ -113,14 +140,18 @@ def error_curves(
                 climate_count = np.zeros(raw_t.shape[1:], np.float64)
                 first_t = np.zeros(raw_t.shape[1:], np.float64)
                 first_mask = np.zeros(raw_t.shape[1:], bool)
+                if diagnostic is not None:
+                    diagnostic.begin(raw_t.shape, window_offset)
             assert climate_count is not None and first_t is not None and first_mask is not None
             k = len(raw_t)
             frame = slice(start, start + k)
+            offset = 0
             for region in _regions(raw_t.shape):
                 check()
                 spatial = region[1:]
                 p = np.array(raw_p[region], dtype=np.float64, order="C").reshape(k, -1, channels)
                 t = np.array(raw_t[region], dtype=np.float64, order="C").reshape(k, -1, channels)
+                exact &= np.array_equal(raw_p[region], raw_t[region])
                 mask = mask_for(None if raw_mask is None else raw_mask[region].reshape(t.shape),
                                 t.shape)
                 if not np.isfinite(np.where(mask, t, 0)).all():
@@ -128,6 +159,9 @@ def error_curves(
                 finite[frame] &= np.isfinite(np.where(mask, p, 0)).all(axis=(1, 2))
                 p = np.where(mask & np.isfinite(p), p, 0)
                 t = np.where(mask, t, 0)
+                if diagnostic is not None:
+                    diagnostic.update(start, offset, p, t)
+                offset += p.shape[1]
                 bc = mask[..., 0].sum(1).astype(np.float64)
                 total = count[frame] + bc
                 first = mask[..., 0].argmax(axis=1)
@@ -170,6 +204,14 @@ def error_curves(
                 del p, t, mask, ps, ts, pa, ta, d, diff, observed
             del raw_p, raw_t, raw_mask
         assert climate_sum is not None and climate_count is not None
+        if diagnostic is not None:
+            offset = 0
+            for region in _regions((1, *climate_sum.shape)):
+                size = climate_sum[region[1:]].size // channels
+                diagnostic.reduce(offset, size)
+                offset += size
+            diagnostic.release()
+        window_offset += climate_sum.size // channels
         climate_sum /= np.maximum(climate_count, 1)
         del climate_count, first_t, first_mask
         for start in range(0, n, frames):
@@ -194,6 +236,14 @@ def error_curves(
     global_mean = origin + ((mean_t - origin) * count[:, None]).sum(0) / total
     sigma = math.sqrt(float(var_t.sum() + (
         (mean_t - global_mean) ** 2 * count[:, None]).sum()) / total)
+    extra = {}
+    if diagnostic is not None:
+        pred_mean = mean_p + anchor_p
+        pred_origin = pred_mean[0]
+        global_pred_mean = pred_origin + ((pred_mean - pred_origin) * count[:, None]).sum(0) / total
+        pred_std = math.sqrt(float(var_p.sum() + (
+            (pred_mean - global_pred_mean) ** 2 * count[:, None]).sum()) / (total * channels))
+        extra = diagnostic.result(pred_mean, mean_t, pred_std)
     var_t, var_p, cov = (x / denominator for x in (var_t, var_p, cov))
     finite &= count > 0
     with np.errstate(all="ignore"):
@@ -217,4 +267,6 @@ def error_curves(
             "ms_true": np.where(count > 0, tt / denominator, np.nan),
             "finite": finite,
             "sigma": np.array(sigma),
+            "exact_copy": np.array(exact),
+            **extra,
         }
