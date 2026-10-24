@@ -1883,3 +1883,41 @@ payload, in addition to producer buffers, numerical scratch, digest state and th
 it is not a process RSS limit. Updates have one producer and no retries. Worker failures
 propagate; discard affected digests after any error. Context exit joins active work and
 preserves a producer exception. Native hashing cannot be interrupted mid-call.
+
+### Exact finite quantiles under a workspace allowance
+
+`arrayroute.quantiles.finite_statistics` computes full-selection min/max, counts, moments
+and up to 16 exact linear quantiles. It converts real values to float64, as explicitly
+recorded by its algorithm contract; integers beyond float64's exact range are rounded for
+statistics. Source bytes remain untouched. NaNs and infinities are counted and excluded
+from finite statistics. No percentile sampling or disk spill is used.
+
+```python
+from arrayroute.quantiles import finite_statistics
+
+summary = finite_statistics(reader, quantiles=(0.01, 0.5, 0.99), workspace_bytes=32 << 20)
+print(summary.count, summary.mean, summary.std, summary.quantiles)
+```
+
+Small selections fit a single pass. Larger selections use ordered IEEE float64 key ranges
+and exact rank counts, refining only the buckets containing requested ranks before bounded
+in-place partitioning. The initial histogram uses 16 bits, refinements use 8. Constant
+selections and ranks covered by the first finite value avoid unnecessary refinement.
+Large selections can require up to nine full read passes; inspect `passes` and benchmark
+your storage policy. This trades extra reads for bounded memory, not universal speedup.
+
+`workspace_bytes` (minimum 4 MiB) covers candidates, ordered I/O batches, working numerical
+arrays, histograms and moment state. The reader allowance, native scratch/cache, source
+ownership and Python/runtime overhead are additional. It is not an RSS limit. Every full
+pass hashes the exact selected native bytes with SHA-256 and must match the first; a changed
+byte stream fails the operation. The hash excludes shape, dtype, units and other metadata:
+pin a dataset revision and metadata throughout; this is not transactional snapshot isolation.
+
+Moments use fixed 4096-row leaves after deterministic origin/scale normalization; signed
+zero is numerically canonicalized. Read/workspace sizes do not change the result. Bitwise
+replay requires pinned NumPy/runtime and source order; cross-platform floating-point
+identity is not promised. Whole-array NumPy moments may differ in last bits. Quantiles use
+linear interpolation, with a finite convex interpolation when subtracting two extreme
+finite endpoints would overflow. Cancellation is checked between reads and numerical
+blocks; it cannot interrupt native calls. `count_nonfinite` provides a cheaper one-pass,
+no-conversion count of NaNs and infinities when moments/percentiles are unnecessary.
