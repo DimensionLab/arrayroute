@@ -47,3 +47,20 @@ def test_compensation_and_ieee_nonfinite_partials():
     assert total.value == float("inf")
     total.add(float("-inf"))
     assert np.isnan(total.value)
+
+
+@pytest.mark.parametrize("byteorder", ["<", ">"])
+@pytest.mark.parametrize("selection", [None, (slice(0, 5, 2),), (1,), (-1,)])
+def test_digest_preserves_nan_payloads_and_scalar_endianness(byteorder, selection):
+    bits = np.array(
+        [0x7FC00001, 0x7FA00007, 0xFFC00019, 0x80000000, 0], dtype=f"{byteorder}u4"
+    )
+    values = bits.view(f"{byteorder}f4")
+    # Slice the integer representation so the reference never converts floating NaNs.
+    selected_bits = bits if selection is None else bits[selection]
+    expected = np.asarray(selected_bits, dtype=bits.dtype).tobytes()
+    digest = hashlib.sha256()
+    update_digest(
+        digest, ArrayReader(NumpyBackend(values), buffer_bytes=128), selection, block_elements=1
+    )
+    assert digest.hexdigest() == hashlib.sha256(expected).hexdigest()

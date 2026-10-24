@@ -31,7 +31,16 @@ class NumpyBackend:
         )
 
     def read(self, selection: Selection) -> np.ndarray:
-        return np.asarray(self.array[selection]).copy(order="C")
+        # NumPy scalar indexing loses non-native dtype byte order; retain array views.
+        axes = tuple(axis for axis, index in enumerate(selection) if isinstance(index, int))
+        slices = []
+        for axis, index in enumerate(selection):
+            if isinstance(index, int):
+                index = index if index >= 0 else index + self.array.shape[axis]
+                slices.append(slice(index, index + 1))
+            else:
+                slices.append(index)
+        return np.squeeze(self.array[tuple(slices)], axis=axes).copy(order="C")
 
 
 class DenseGatherBackend:
