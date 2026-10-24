@@ -43,6 +43,42 @@ lossy conversion is performed. Decoded-byte estimates assume full inner-chunk de
 partial codecs can do better. Transport bytes must be measured by the backend, not inferred
 from those estimates. A large logical shape is not evidence of large physical I/O throughput.
 
+### Indexed diagnostic reads and bounded row samples
+
+`arrayroute.indexed.take_flat(reader, indices, selection=...)` gathers indices in the
+C-flattened selected view, retaining requested order, duplicates and source dtype bits.
+Negative indices count from the end. It groups requests by physical chunk and joins the
+bounding region when every touched chunk is requested and the result plus read fits the
+reader allowance. Otherwise it subdivides occupied groups without scanning empty regions.
+It does not require an entire spatial frame in memory. One decoded storage chunk must fit.
+Python coordinate metadata uses additional O(requested values × rank) memory; codec scratch
+and backend caches are also outside the payload allowance. Shared read budgets and
+cancellation between reads are supported.
+
+```python
+from arrayroute.indexed import take_flat
+from arrayroute.sample import ALGORITHM, PrioritySample
+
+values = take_flat(reader, [19, 5, 19], selection=selection)
+sample = PrioritySample(4096, seed=0)
+for rows in bounded_row_batches:
+    sample.update(rows)
+rows, input_positions = sample.result()
+```
+
+`PrioritySample` retains the rows with the lowest seeded PCG64 priorities, breaking ties by
+input position. Results are returned in original input order and are independent of update
+batch boundaries. Record `ALGORITHM`, seed, capacity, NumPy version and the ordered input
+manifest for replay. This is not a cross-version RNG or distributed merge guarantee.
+Retained arrays use capacity × (row bytes + 16); updates additionally need bounded input
+and merge/partition buffers. Rows and returned arrays are owned copies.
+
+Selected reads are a memory/access primitive, not a universal speedup. Random points can
+touch nearly every storage chunk, and small serial requests may be slower than a dense
+read. Benchmark the actual layout, cache state, engine and selection density. Changing the
+I/O plan preserves selected values; changing sampling capacity or input order changes the
+statistical sample and must be recorded separately.
+
 `ReadPlan.decoded_bytes_upper_bound` measures total decode work; it is separate from
 `peak_decoded_bytes_upper_bound`, which determines memory admission together with the output.
 By default all touched chunks are charged as live. A backend may declare an
