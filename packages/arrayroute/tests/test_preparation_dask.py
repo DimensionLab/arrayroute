@@ -2,7 +2,6 @@
 """Real Dask processes, including a killed worker, over a shared local repository."""
 import logging
 import os
-from functools import partial
 
 import numpy as np
 import pytest
@@ -13,22 +12,6 @@ distributed = pytest.importorskip("distributed")
 
 from arrayroute.preparation import Preparation  # noqa: E402
 from arrayroute.snapshot import FilesystemRepository, Snapshot, SnapshotReadSession  # noqa: E402
-
-
-def gradient(values):
-    return np.gradient(values, 2, axis=1)
-
-
-def crash_once(values, *, marker):
-    if values.flat[0] == 0:
-        try:
-            fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        except FileExistsError:
-            pass
-        else:
-            os.close(fd)
-            os._exit(79)
-    return gradient(values)
 
 
 @pytest.mark.parametrize("kill_worker", [False, True])
@@ -45,7 +28,22 @@ def test_dask_preparation_and_worker_recovery(tmp_path, kill_worker):
                              halo=(0, 1, 1), dtype="float32", operation="gradient-v1",
                              parameters={"spacing_m": 2}, attributes={"units": "1/s"})
     marker = tmp_path / "crashed-once"
-    operator = partial(crash_once, marker=str(marker)) if kill_worker else gradient
+    # Closures model notebook-defined operators without relying on pytest's import path.
+    marker_path = str(marker)
+
+    def gradient(values):
+        return np.gradient(values, 2, axis=1)
+
+    def operator(values):
+        if kill_worker and values.flat[0] == 0:
+            try:
+                fd = os.open(marker_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            except FileExistsError:
+                pass
+            else:
+                os.close(fd)
+                os._exit(79)
+        return gradient(values)
     with distributed.LocalCluster(n_workers=2, threads_per_worker=1, processes=True,
                                   host="127.0.0.1", dashboard_address="127.0.0.1:0",
                                   memory_limit=0, silence_logs=logging.ERROR) as cluster:
