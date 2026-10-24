@@ -64,3 +64,43 @@ def test_digest_preserves_nan_payloads_and_scalar_endianness(byteorder, selectio
         digest, ArrayReader(NumpyBackend(values), buffer_bytes=128), selection, block_elements=1
     )
     assert digest.hexdigest() == hashlib.sha256(expected).hexdigest()
+
+
+@pytest.mark.parametrize("shape", [(), (0,), (5, 0, 3), (129, 32, 16, 3), (5, 7, 11), (1, 1)])
+@pytest.mark.parametrize("limit", [1, 7, 64, 1000, 65536])
+def test_aligned_blocks_preserve_bounded_flat_coverage(shape, limit):
+    import math
+
+    from arrayroute.ordered import flat_blocks, flat_regions
+
+    blocks = list(flat_blocks(shape, limit))
+    position = 0
+    for start, stop in blocks:
+        assert start == position
+        assert 0 < stop - start <= limit
+        # Alignment turns every block into one rectangle, including a ragged last block.
+        assert len(list(flat_regions(shape, start, stop))) == 1
+        position = stop
+    assert position == math.prod(shape)
+
+
+@pytest.mark.parametrize("limit", [0, -1, True, 1.5])
+def test_aligned_blocks_reject_invalid_allowance(limit):
+    from arrayroute.ordered import flat_blocks
+
+    with pytest.raises(ValueError):
+        list(flat_blocks((10,), limit))
+
+
+def test_default_hash_batches_rows_without_changing_bytes():
+    values = np.arange(129 * 32 * 16 * 3, dtype="f4").reshape(129, 32, 16, 3)
+    reader = ArrayReader(NumpyBackend(values), buffer_bytes=128 << 10)
+    digest, stats = hashlib.sha256(), ReadStats()
+    update_digest(digest, reader, stats=stats)
+    assert digest.hexdigest() == hashlib.sha256(values.tobytes()).hexdigest()
+    assert stats.requests == 13  # ten complete rows per bounded batch
+    assert stats.output_bytes == values.nbytes
+    scalar = ArrayReader(NumpyBackend(np.array([3.], dtype="f8")), buffer_bytes=8)
+    digest = hashlib.sha256()
+    update_digest(digest, scalar, (0,))
+    assert digest.hexdigest() == hashlib.sha256(np.array(3.).tobytes()).hexdigest()

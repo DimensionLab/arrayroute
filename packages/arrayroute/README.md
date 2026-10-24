@@ -2136,3 +2136,13 @@ changing platforms or matching older float32 means bitwise is outside that guara
 Finite-input arithmetic overflow raises; nonfinite inputs propagate IEEE values. Cancellation
 is checked between source reads; it cannot interrupt a blocking backend operation.
 `source_stats` measures underlying reads separately from the outer reader's derived output.
+
+Ordered hashing and derived-array reads use rectangular batches aligned to complete
+trailing array dimensions. `arrayroute.ordered.flat_blocks(shape, max_elements)` yields
+bounded C-order intervals without splitting a batch across an enclosing row boundary.
+This reduces repeated storage calls while preserving the selected value order.
+`update_digest` defaults to at most 1,048,576 elements and half the reader's allowance
+(at least one element when admitted). An explicit `block_elements` remains an upper bound.
+Its byte stream, including native endianness and NaN payloads, is unchanged. Hash output
+scratch is additional to the source reader's allowance. This batching policy does not
+change the mean or magnitude algorithm identifiers.

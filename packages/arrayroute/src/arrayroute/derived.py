@@ -3,12 +3,11 @@
 
 from __future__ import annotations
 
-import math
 from collections.abc import Callable
 
 import numpy as np
 
-from .ordered import OrderedSelection, read_flat
+from .ordered import OrderedSelection, flat_blocks, read_flat
 from .plan import ArraySpec, Selection
 from .reader import ArrayReader, ReadStats
 
@@ -87,12 +86,10 @@ class VectorMagnitudeBackend:
         ordered = OrderedSelection.create(self.source, (*selection, slice(None)))
         components = self.source.backend.spec.shape[-1]
         shape = ordered.shape[:-1]
-        count = math.prod(shape)
         output = np.empty(shape, dtype=self.dtype)
         flat = output.reshape(-1)
-        for start in range(0, count, self.rows_per_block):
+        for start, stop in flat_blocks(shape, self.rows_per_block):
             self._check_cancelled()
-            stop = min(count, start + self.rows_per_block)
             raw = read_flat(
                 ordered, start * components, stop * components, self.source_stats, self.cancelled,
             )

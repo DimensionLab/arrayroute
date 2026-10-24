@@ -3,12 +3,11 @@
 
 from __future__ import annotations
 
-import math
 from collections.abc import Callable, Sequence
 
 import numpy as np
 
-from .ordered import OrderedSelection, read_flat
+from .ordered import OrderedSelection, flat_blocks, read_flat
 from .plan import ArraySpec, Selection, plan
 from .reader import ArrayReader, ReadStats
 
@@ -107,9 +106,8 @@ class StackBackend(_Sources):
                 if isinstance(member, int)
                 else output.reshape(len(indices), -1)[out_index]
             )
-            for start in range(0, flat.size, self.block_elements):
+            for start, stop in flat_blocks(source.shape, self.block_elements):
                 self.check()
-                stop = min(flat.size, start + self.block_elements)
                 flat[start:stop] = read_flat(source, start, stop, self.source_stats, self.cancelled)
         return output
 
@@ -147,8 +145,7 @@ class MeanBackend(_Sources):
         ordered = [OrderedSelection.create(r, selection) for r in self.sources]
         output = np.empty(ordered[0].shape, self.dtype)
         flat = output.reshape(-1)
-        for start in range(0, math.prod(output.shape), self.block_elements):
-            stop = min(flat.size, start + self.block_elements)
+        for start, stop in flat_blocks(output.shape, self.block_elements):
             total, correction = np.zeros(stop - start), np.zeros(stop - start)
             with np.errstate(over="ignore", invalid="ignore"):
                 for source in ordered:

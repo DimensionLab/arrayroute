@@ -14,6 +14,32 @@ from .plan import Selection
 from .reader import ArrayReader, ReadStats
 
 
+def flat_blocks(shape: tuple[int, ...], max_elements: int) -> Iterator[tuple[int, int]]:
+    """Partition C-order values on the largest complete trailing dimensions that fit.
+
+    Boundaries affect I/O only. Every element appears exactly once in increasing flat
+    order; ragged final blocks and axes larger than the allowance remain bounded.
+    """
+    if isinstance(max_elements, bool) or not isinstance(max_elements, int) or max_elements < 1:
+        raise ValueError("max_elements must be a positive integer")
+    if any(n < 0 for n in shape):
+        raise ValueError("Array dimensions cannot be negative")
+    size = math.prod(shape)
+    if size == 0:
+        return
+    width, parent_width = 1, size
+    for n in reversed(shape):
+        if width * n > max_elements:
+            parent_width = width * n
+            break
+        width *= n
+    count = max_elements // width * width
+    for parent in range(0, size, parent_width):
+        end = parent + parent_width
+        for start in range(parent, end, count):
+            yield start, min(end, start + count)
+
+
 def flat_regions(
     shape: tuple[int, ...], start: int, stop: int, prefix: tuple = ()
 ) -> Iterator[tuple]:
@@ -101,7 +127,7 @@ def update_digest(
     reader: ArrayReader,
     selection: Selection | None = None,
     *,
-    block_elements: int = 65536,
+    block_elements: int | None = None,
     stats: ReadStats | None = None,
     cancelled: Callable[[], bool] | None = None,
 ) -> None:
@@ -110,20 +136,26 @@ def update_digest(
     Layout, chunks and read boundaries do not change the byte stream. Read allowance plus
     one bounded output interval covers explicit buffers, excluding backend caches/scratch.
     Neither dtype conversion nor NaN/signed-zero canonicalization is performed.
+    By default, batches use at most 1,048,576 elements and half the reader allowance,
+    aligned to complete trailing dimensions. An explicit block_elements is an upper bound.
     """
-    if (
+    if block_elements is not None and (
         isinstance(block_elements, bool)
         or not isinstance(block_elements, int)
         or block_elements < 1
     ):
         raise ValueError("block_elements must be a positive integer")
     source = OrderedSelection.create(reader, selection)
-    size = math.prod(source.shape)
-    count = min(block_elements, reader.buffer_bytes // reader.backend.dtype.itemsize)
+    count = min(
+        (1 << 20) if block_elements is None else block_elements,
+        reader.buffer_bytes // reader.backend.dtype.itemsize,
+        max(1, reader.buffer_bytes // (reader.backend.dtype.itemsize * 2))
+        if block_elements is None else block_elements,
+    )
     if count < 1:
         raise MemoryError("Reader allowance cannot fit one element")
     stats = stats if stats is not None else ReadStats()
-    for start in range(0, size, count):
-        values = read_flat(source, start, min(size, start + count), stats, cancelled)
+    for start, stop in flat_blocks(source.shape, count):
+        values = read_flat(source, start, stop, stats, cancelled)
         digest.update(memoryview(values).cast("B"))
         del values
