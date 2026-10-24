@@ -2327,3 +2327,13 @@ distributed topology are not promised.
 against NumPy. Add `--distributed --expected-nodes N` under `torchrun` to test the
 collective and reported node count. It is a runtime smoke check, not a performance
 benchmark or proof that reported nodes are distinct physical machines.
+
+For an explicitly requested transport benchmark, add
+`--collective-bytes 4 --collective-bytes 1048576 --collective-iterations 10`
+on every rank. The doctor verifies each float32 sum, synchronizes CUDA work, and
+reports p50/p95 wall time using the slowest rank after two warmups. Barriers and
+validation are outside the timer. Payload bytes/s is algorithm bandwidth, not
+physical link bandwidth or end-to-end training throughput. Up to eight distinct
+sizes are accepted (multiples of four bytes, at most 64 MiB), with 3–100 measured
+iterations. Ranks reject differing measurement requests. The existing 60-second
+process-group timeout also applies to these operations.
