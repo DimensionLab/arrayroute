@@ -203,9 +203,59 @@ def test_array_valued_dtype_rejected_before_payload(tmp_path, monkeypatch):
     path = tmp_path / "array-dtype.h5"
     with h5py.File(path, "w") as f:
         f.create_dataset("x", shape=(20,), dtype=np.dtype(("f4", (3,))))
+
     def forbidden(*args):
         pytest.fail("Array-valued dtype reached payload reading")
+
     monkeypatch.setattr(HDF5Backend, "read", forbidden)
     with HDF5ReadSession(path) as s:
         with pytest.raises(TypeError, match="dimension expansion"):
             s.read_columns()
+
+
+def test_scalar_and_metadata_admission(tmp_path):
+    path = tmp_path / "scalar.h5"
+    with h5py.File(path, "w") as f:
+        f["scalar"] = np.float64(-0.0)
+        f["text"] = "variable length"
+        f["link"] = h5py.SoftLink("/scalar")
+    with HDF5ReadSession(path, buffer_bytes=8) as s:
+        assert s.metadata("scalar").shape == ()
+        assert s.read_scalar("scalar").tobytes() == np.float64(-0.0).tobytes()
+        with pytest.raises(TypeError, match="fixed-size"):
+            s.read_scalar("text")
+        with pytest.raises(ValueError, match="soft"):
+            s.metadata("link")
+    with HDF5ReadSession(path, buffer_bytes=4) as s:
+        with pytest.raises(MemoryError):
+            s.read_scalar("scalar")
+
+
+@pytest.mark.parametrize("time_chunk", [None, 1, 2])
+def test_large_strided_frames_match_native_without_repeated_chunk_decode(
+    tmp_path, monkeypatch, time_chunk
+):
+    path = tmp_path / "frames.h5"
+    values = np.arange(8 * 256 * 1024, dtype=np.float32).reshape(8, 256, 1024)
+    with h5py.File(path, "w") as f:
+        f.create_dataset(
+            "frames",
+            data=values,
+            **({"chunks": (time_chunk, 256, 1024), "compression": "gzip"} if time_chunk else {}),
+        )
+    calls = []
+    original = h5py.Dataset.read_direct
+
+    def read(self, *args, **kwargs):
+        calls.append(kwargs["source_sel"])
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(h5py.Dataset, "read_direct", read)
+    for mode in ["native", "auto"]:
+        calls.clear()
+        with HDF5ReadSession(path, strided_reads=mode) as session:
+            result = session.open("frames").read((slice(None, None, 2), slice(None), slice(None)))
+        assert result.tobytes() == values[::2].tobytes()
+        assert len(calls) == (4 if mode == "auto" and time_chunk in (None, 1) else 1)
+    with pytest.raises(ValueError, match="strided_reads"):
+        HDF5ReadSession(path, strided_reads="unknown")

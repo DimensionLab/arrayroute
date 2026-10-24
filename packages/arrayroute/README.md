@@ -252,6 +252,21 @@ storage, not a physical chunk grid. Probe reports expose `source_storage_layout`
 `source_chunks: null` for contiguous storage. Native codec scratch, metadata and consumer
 retention are additional memory. The HDF5 raw chunk cache is disabled.
 
+For strided selections over large frames, the default `strided_reads="auto"` policy may
+issue separate `read_direct` calls into one admitted output buffer. It applies only to the
+first retained axis, with at least two selected frames of at least 1 MiB each, unit stride
+on remaining retained axes, and either contiguous storage or one-frame chunks on that axis.
+This avoids expensive HDF5 hyperslab traversal without repeatedly decoding chunks spanning
+multiple frames. `HDF5ReadSession(..., strided_reads="native")` preserves native bulk reads
+for controlled comparisons. Planned decode costs remain conservative; `ReadStats.requests`
+counts tile plans, not individual HDF5 calls. The policy is measured on a local 3D fixture,
+not established as optimal for every filesystem or workload.
+
+`metadata(path)` borrows an embedded h5py node for metadata inspection; it does not transfer
+ownership. `read_scalar(path)` admits a fixed-size scalar separately. Scalar reads and
+metadata are outside streamed tile statistics; they still enforce session ownership and
+embedded-data restrictions.
+
 Column projection admits only requested one-dimensional columns and preserves their order.
 Inspection streams finite counts and extrema, retaining native integer precision. Fixed-size
 strings may be inspected as numbers; variable-length strings, references, array-valued dtypes,

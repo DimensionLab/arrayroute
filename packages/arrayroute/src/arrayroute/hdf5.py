@@ -7,7 +7,7 @@ import os
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 
@@ -23,7 +23,16 @@ class HDF5Backend:
     metadata are additional. HDF5's raw chunk cache is disabled by the owning session.
     """
 
-    def __init__(self, dataset: Any, check_open: Callable[[], None]):
+    def __init__(
+        self,
+        dataset: Any,
+        check_open: Callable[[], None],
+        *,
+        strided_reads: Literal["auto", "native"] = "auto",
+    ):
+        if strided_reads not in ("auto", "native"):
+            raise ValueError("strided_reads must be auto or native")
+        self.strided_reads: Literal["auto", "native"] = strided_reads
         import h5py
 
         self._dataset = dataset
@@ -52,7 +61,33 @@ class HDF5Backend:
         request = plan(self.spec, selection)
         result = np.empty(request.output_shape, dtype=self.dtype)
         if result.size:
-            self._dataset.read_direct(result, source_sel=request.selection)
+            slices = [
+                (axis, sel) for axis, sel in enumerate(request.selection) if isinstance(sel, slice)
+            ]
+            framewise = False
+            if self.strided_reads == "auto" and slices:
+                axis, region = slices[0]
+                count = len(range(region.start, region.stop, region.step))
+                framewise = (
+                    region.step > 1
+                    and count > 1
+                    and result.nbytes // count >= 1 << 20
+                    and all(s.step == 1 for _, s in slices[1:])
+                    and (self.spec.contiguous or self.spec.chunks[axis] == 1)
+                )
+            if framewise:
+                # HDF5's bulk strided hyperslab traversal is costly for large frames.
+                # Split only on independent frame storage, avoiding repeated chunk decode.
+                axis, region = slices[0]
+                for index, source_index in enumerate(range(region.start, region.stop, region.step)):
+                    source = list(request.selection)
+                    source[axis] = source_index
+                    destination = (index,) + (slice(None),) * (result.ndim - 1)
+                    self._dataset.read_direct(
+                        result, source_sel=tuple(source), dest_sel=destination
+                    )
+            else:
+                self._dataset.read_direct(result, source_sel=request.selection)
         return result
 
 
@@ -69,13 +104,21 @@ class HDF5ReadSession:
     """
 
     def __init__(
-        self, path: str | Path, *, buffer_bytes: int = 128 << 20, max_open_arrays: int = 64
+        self,
+        path: str | Path,
+        *,
+        buffer_bytes: int = 128 << 20,
+        max_open_arrays: int = 64,
+        strided_reads: Literal["auto", "native"] = "auto",
     ):
         for name, value in [("buffer_bytes", buffer_bytes), ("max_open_arrays", max_open_arrays)]:
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
         import h5py
 
+        if strided_reads not in ("auto", "native"):
+            raise ValueError("strided_reads must be auto or native")
+        self.strided_reads: Literal["auto", "native"] = strided_reads
         self.path = Path(path)
         self.buffer_bytes = buffer_bytes
         self.max_open_arrays = max_open_arrays
@@ -113,6 +156,30 @@ class HDF5ReadSession:
             current = current[part]
         return current
 
+    def metadata(self, path: str = "/") -> Any:
+        """Borrow a validated embedded h5py node for metadata inspection only.
+
+        Ownership remains with the session. Metadata and attributes are not covered by
+        payload buffer limits. Use open()/read_scalar() for payload access.
+        """
+        return self._resolve(path)
+
+    def read_scalar(self, path: str) -> np.ndarray:
+        """Read one fixed-size scalar after dtype, storage and byte admission."""
+        import h5py
+
+        node = self._resolve(path)
+        if not isinstance(node, h5py.Dataset) or node.shape != ():
+            raise ValueError("Choose a scalar HDF5 dataset")
+        dtype = np.dtype(node.dtype)
+        if dtype.hasobject or dtype.subdtype is not None or not dtype.itemsize:
+            raise TypeError("Scalar reads require a fixed-size, non-array dtype")
+        if node.is_virtual or node.external:
+            raise ValueError("HDF5 arrays must store data in this file")
+        if dtype.itemsize > self.buffer_bytes:
+            raise MemoryError("HDF5 scalar exceeds read allowance")
+        return np.asarray(node[()], dtype=dtype)
+
     def open(self, path: str) -> ArrayReader:
         import h5py
 
@@ -126,7 +193,10 @@ class HDF5ReadSession:
         dataset = self._resolve(path)
         if not isinstance(dataset, h5py.Dataset):
             raise ValueError("Choose an HDF5 dataset, not a group")
-        reader = ArrayReader(HDF5Backend(dataset, self._check_open), buffer_bytes=self.buffer_bytes)
+        reader = ArrayReader(
+            HDF5Backend(dataset, self._check_open, strided_reads=self.strided_reads),
+            buffer_bytes=self.buffer_bytes,
+        )
         self._readers[key] = reader
         while len(self._readers) > self.max_open_arrays:
             self._readers.popitem(last=False)
