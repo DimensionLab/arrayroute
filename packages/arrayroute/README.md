@@ -2052,3 +2052,42 @@ size, identity, mode or timestamp changes fail. These checks do not create a poi
 filesystem snapshot or defend against hostile concurrent parent-directory replacement.
 SHA-256 identifies archive bytes; it is not authentication. This is a transfer artifact,
 not a random-access replacement for Zarr or other scientific storage backends.
+
+## Stream paired rollout error curves
+
+`arrayroute.error_curves.error_curves` scores immutable prediction/reference readers with
+shape `(time, spatial..., component)`. It returns relative L2, vector RMSE, normalized RMSE,
+anomaly correlation, mean-square energy, persistence and climatology curves. Binary validity
+masks must match the shape and be common across vector components. Observed nonfinite
+references fail; observed nonfinite predictions receive infinite error.
+
+```python
+from arrayroute.error_curves import ALGORITHM, error_curves
+
+curves = error_curves(prediction_reader, reference_reader,
+                      validity=validity_reader, buffer_bytes=128 << 20)
+print(ALGORITHM, curves["rmse"], curves["l2_rel"])
+```
+
+Pass `validity=None` when all points are observed. RMSE and `sigma` retain the input field's
+physical units; mean-square curves have squared units. Normalized errors and correlation are
+dimensionless. Persistence uses points observed both at the initial and current step. An
+empty intersection has infinite persistence error and must not be interpreted as baseline
+skill. Climatology uses each point's observed times; it is a retrospective reference, not a
+forecast trained without future data.
+
+The two-pass float64 reduction uses fixed spatial groups of at most 256 points. Coalesced
+read windows can change with the I/O allowance without changing the reduction order.
+Identical input values **and shape** reproduce curve bytes across storage chunk layouts,
+I/O budgets and repeated calls on the same numerical stack. Reshaping spatial axes can
+change grouping and roundoff. Cross-platform bit identity and identity to older monolithic
+NumPy reductions are not promised. Record `ALGORITHM` with numerical results.
+
+The allowance admits numerical state, workspace, retained read windows and planned I/O.
+Backend caches, codec scratch and Python metadata are additional; it is not an RSS ceiling.
+State scales with time/component count, and a whole-time canonical spatial column must fit.
+This implementation does not yet tile that time axis or distribute a reduction across ranks.
+Callers must separately budget simultaneous reductions; a reader's shared I/O pool does not
+reserve the numerical workspace. Cancellation is checked between reads and reductions,
+not inside blocking backend calls. Reduced memory does not imply faster full-volume scoring:
+keep a direct-engine baseline for the actual workload.
