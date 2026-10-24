@@ -67,7 +67,10 @@ def staged_directory(
     )
     stage = container / destination.name
     try:
-        stage.mkdir()
+        # Check filesystem support before the caller spends time producing data.
+        probe = container / ("payload" if destination.name != "payload" else "other-payload")
+        probe.mkdir()
+        _exclusive_rename(probe, stage)
         yield stage
         if cancelled is not None and cancelled():
             raise InterruptedError("Directory publication cancelled")

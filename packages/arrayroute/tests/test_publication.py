@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import errno
 import os
 import shutil
 import subprocess
@@ -19,6 +20,18 @@ def test_complete_tree_visible_only_at_commit(tmp_path):
         assert not target.exists()
     assert (target / "values").read_bytes() == bytes(range(256))
     assert list(tmp_path.iterdir()) == [target]
+
+
+def test_unsupported_filesystem_fails_before_dataset_work(tmp_path, monkeypatch):
+    from arrayroute import publication
+
+    def unsupported(*args):
+        raise OSError(errno.ENOTSUP, "exclusive rename unavailable")
+
+    monkeypatch.setattr(publication, "_exclusive_rename", unsupported)
+    with pytest.raises(OSError, match="unavailable"), staged_directory(tmp_path / "dataset"):
+        pytest.fail("expensive dataset work must not start")
+    assert list(tmp_path.iterdir()) == []
 
 
 @pytest.mark.parametrize("kind", ["empty", "populated", "file", "symlink"])
