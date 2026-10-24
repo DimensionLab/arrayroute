@@ -768,6 +768,15 @@ spawned worker serialization retain that ID; they do not follow a newer branch. 
 read-only. `session.attributes(path)` reads metadata from that same revision. Use one
 session per worker and multiprocessing **spawn**, not fork.
 
+`session.read_rows("velocity", [12, 3, 12, -1], tail=...)` gathers an ordered batch
+along the first axis. It preserves duplicates, dtype bits and the pinned revision while
+coalescing selected rows where the read allowance permits. Use `coalesce=False` to measure
+unmerged reads. For concurrent thread-owned sessions, pass the same process-local
+`ReadBudget` as `read_budget=pool`. A batch reserves its output plus its largest planned
+read, so small batches can overlap without reserving unused capacity. Retained results,
+codec scratch and native caches remain additional memory. Pooled sessions cannot be
+serialized; construct the pool and sessions inside each spawned process.
+
 Local snapshot readers use a 1 MiB target before splitting one object's read into parallel
 ranges. This reduces small-file operations; it does not enlarge the requested selection or
 read extra field values. Remote readers retain the storage backend's policy. Override with

@@ -77,6 +77,32 @@ def test_concurrent_materializations_do_not_nest_or_deadlock():
     assert pool.snapshot()['used_bytes'] == 0
 
 
+def test_small_batches_share_capacity_while_native_reads_are_active():
+    values = np.arange(32 * 4, dtype='f4').reshape(32, 4)
+    pool = ReadBudget(1024)
+    barrier = threading.Barrier(2)
+
+    class Concurrent(Observed):
+        def read(self, selection):
+            barrier.wait(timeout=5)
+            assert pool.snapshot()['active'] == 2
+            barrier.wait(timeout=5)
+            return super().read(selection)
+
+    def run(ids):
+        return read_rows(ArrayReader(Concurrent(values, (1, 4)), shared_budget=pool), ids)
+
+    ids = [[3, 2, 1], [9, 7, 9]]
+    with ThreadPoolExecutor(2) as executor:
+        results = list(executor.map(run, ids))
+    for result, selected in zip(results, ids, strict=True):
+        assert result.tobytes() == values[selected].tobytes()
+    # Outputs: 48 + 48; native output + decoded chunks: 96 + 64.
+    assert pool.snapshot()['peak_bytes'] == 256
+    assert pool.snapshot()['peak_active'] == 2
+    assert pool.snapshot()['used_bytes'] == 0
+
+
 @pytest.mark.parametrize('ids,error', [([12], IndexError), ([-13], IndexError),
                                     ([1.5], TypeError), ([True], TypeError),
                                     ([np.bool_(False)], TypeError)])

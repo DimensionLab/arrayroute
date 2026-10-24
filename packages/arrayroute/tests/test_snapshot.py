@@ -159,3 +159,124 @@ def test_virtual_chunk_access_is_not_implicitly_authorized(tmp_path):
     sid = writer.commit("external object reference")
     with pytest.raises(ic.IcechunkError):
         SnapshotReadSession(Snapshot(location, sid)).read("field", (slice(None),))
+
+
+@pytest.mark.parametrize("coalesce", [False, True])
+def test_row_batches_replay_order_and_bits_after_branch_changes(repository, coalesce):
+    from arrayroute.reader import ReadStats
+
+    location, repo, values, sid = repository
+    session = SnapshotReadSession(Snapshot(location, sid), buffer_bytes=64 << 10)
+    indices = [3, 0, -1, 2, 0]
+    tail = (slice(None, None, 3), 2, slice(1, None, 2), slice(None))
+    expected = np.stack([values[(i, *tail)] for i in indices])
+    writer = repo.writable_session("main")
+    zarr.open_group(writer.store, mode="a")["velocity"][:] = -123
+    writer.commit("replace current branch")
+    for candidate in (session, pickle.loads(pickle.dumps(session))):
+        stats = ReadStats()
+        result = candidate.read_rows("velocity", indices, tail=tail,
+                                     coalesce=coalesce, stats=stats)
+        assert result.tobytes() == expected.tobytes()
+        assert stats.requests > 0
+        candidate.clear()
+        assert candidate.read_rows("velocity", indices, tail=tail).tobytes() == expected.tobytes()
+
+
+def test_thread_sessions_share_budget_for_real_snapshot_batches(repository, monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from arrayroute.backends import ZarrBackend
+    from arrayroute.budget import ReadBudget
+
+    location, _, values, sid = repository
+    budget = ReadBudget(64 << 10)
+    barrier = threading.Barrier(6)
+    native_read = ZarrBackend.read
+
+    def checked_read(backend, selection):
+        state = budget.snapshot()
+        assert 0 < state["used_bytes"] <= budget.max_bytes
+        return native_read(backend, selection)
+
+    monkeypatch.setattr(ZarrBackend, "read", checked_read)
+
+    def gather(rank):
+        session = SnapshotReadSession(Snapshot(location, sid), read_budget=budget)
+        assert session.open("velocity").buffer_bytes == budget.max_bytes
+        barrier.wait(timeout=10)
+        indices = [rank % 4, 0, -1, rank % 4]
+        tail = (slice(None, None, 2), 4, slice(None), 1)
+        result = session.read_rows("velocity", indices, tail=tail)
+        assert result.tobytes() == np.stack([values[(i, *tail)] for i in indices]).tobytes()
+
+    with ThreadPoolExecutor(6) as executor:
+        list(executor.map(gather, range(6)))
+    assert budget.snapshot()["used_bytes"] == 0
+    assert 0 < budget.snapshot()["peak_bytes"] <= budget.max_bytes
+
+
+def test_snapshot_budget_lifecycle_cancel_error_and_spawn(repository, monkeypatch):
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    from arrayroute.budget import ReadBudget
+
+    location, _, _, sid = repository
+    budget = ReadBudget(64 << 10)
+    session = SnapshotReadSession(Snapshot(location, sid), read_budget=budget)
+    reader = session.open("velocity")
+    assert reader.shared_budget is budget
+    with pytest.raises(TypeError, match="after spawn"):
+        pickle.dumps(session)
+    session.clear()
+    assert session.open("velocity").shared_budget is budget
+    stream = session.open("velocity").stream((slice(None),) * 5)
+    next(stream)
+    assert budget.snapshot()["used_bytes"] > 0
+    stream.close()
+    assert budget.snapshot()["used_bytes"] == 0
+
+    cancel = threading.Event()
+    with ThreadPoolExecutor(1) as executor:
+        with budget.reserve(budget.max_bytes):
+            pending = executor.submit(session.read_rows, "velocity", [0],
+                                      cancelled=cancel.is_set)
+            deadline = time.monotonic() + 5
+            while budget.snapshot()["waiting"] != 1:
+                assert time.monotonic() < deadline
+                time.sleep(.001)
+            cancel.set()
+            with pytest.raises(InterruptedError):
+                pending.result(timeout=5)
+    assert budget.snapshot()["used_bytes"] == budget.snapshot()["waiting"] == 0
+
+    def broken_read(_):
+        raise OSError("unavailable object")
+
+    monkeypatch.setattr(session.open("velocity").backend, "read", broken_read)
+    with pytest.raises(OSError, match="unavailable"):
+        session.read_rows("velocity", [0])
+    assert budget.snapshot()["used_bytes"] == 0
+
+
+def test_snapshot_rows_reject_oversized_and_invalid_batches_before_payload(repository, monkeypatch):
+    from arrayroute.budget import ReadBudget
+
+    location, _, _, sid = repository
+    session = SnapshotReadSession(Snapshot(location, sid), read_budget=ReadBudget(8192))
+
+    def unexpected_read(_):
+        pytest.fail("invalid selection reached payload I/O")
+
+    monkeypatch.setattr(session.open("velocity").backend, "read", unexpected_read)
+    with pytest.raises(MemoryError):
+        session.read_rows("velocity", [0, 1])
+    with pytest.raises(TypeError):
+        session.read_rows("velocity", [True], tail=(0, 0, 0, 0))
+    with pytest.raises(IndexError):
+        session.read_rows("velocity", [4], tail=(0, 0, 0, 0))
+    with pytest.raises(TypeError, match="ReadBudget"):
+        SnapshotReadSession(Snapshot(location, sid), read_budget=1)

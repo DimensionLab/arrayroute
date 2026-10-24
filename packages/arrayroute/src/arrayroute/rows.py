@@ -61,8 +61,9 @@ def read_rows(
     change the sampler or optimizer order. ``tail`` selects the remaining axes.
 
     The reader's allowance covers the complete output plus one read's planned
-    decoded/output buffers. A shared pool admits that whole allowance atomically,
-    avoiding nested reservations. Native caches, codec scratch, encoded bytes and
+    decoded/output buffers. A shared pool admits the output plus the largest planned
+    read atomically, avoiding nested reservations without reserving unused capacity.
+    Native caches, codec scratch, encoded bytes and
     Python index metadata (O(batch rows)) are additional, as for ordinary reads.
     Split a batch if its output and a row read cannot fit. No data cache survives
     this call. The source must remain immutable for its duration.
@@ -101,20 +102,13 @@ def read_rows(
     if not output_bytes:
         return np.empty(output_shape, dtype=reader.backend.dtype)
 
-    reservation = (
-        reader.shared_budget.reserve(reader.buffer_bytes, cancelled=cancelled)
-        if reader.shared_budget is not None else nullcontext()
-    )
-    with reservation:
-        output = np.empty(output_shape, dtype=reader.backend.dtype)
-        worker = ArrayReader(reader.backend, buffer_bytes=reader.buffer_bytes - output_bytes)
-        rows = sorted(destinations)
-        position = 0
-        run_end = 0
-        stride = 1
+    worker = ArrayReader(reader.backend, buffer_bytes=reader.buffer_bytes - output_bytes)
+    rows = sorted(destinations)
+
+    def requests():
+        position, run_end, stride = 0, 0, 1
         while position < len(rows):
             check_cancelled()
-            begin = rows[position]
             end_position = position + 1
             if coalesce:
                 if position == run_end:
@@ -125,6 +119,28 @@ def read_rows(
                         while run_end < len(rows) and rows[run_end] - rows[run_end - 1] == stride:
                             run_end += 1
                 end_position = _fitting_end(worker, rows, position, run_end, tail, stride)
+            yield position, end_position, stride
+            position = end_position
+
+    # Only pooled reads need a preflight pass. Keep request metadata O(batch rows),
+    # and retain the exact plan boundaries for dispatch after admission.
+    batches = list(requests()) if reader.shared_budget is not None else requests()
+    amount = output_bytes
+    if reader.shared_budget is not None:
+        for start, stop, stride in batches:
+            request = worker.plan((slice(rows[start], rows[stop - 1] + 1, stride), *tail))
+            amount = max(amount, output_bytes + min(
+                request.buffer_bytes_upper_bound, worker.buffer_bytes,
+            ))
+    reservation = (
+        reader.shared_budget.reserve(amount, cancelled=cancelled)
+        if reader.shared_budget is not None else nullcontext()
+    )
+    with reservation:
+        output = np.empty(output_shape, dtype=reader.backend.dtype)
+        for position, end_position, stride in batches:
+            check_cancelled()
+            begin = rows[position]
             values = worker.read(
                 (slice(begin, rows[end_position - 1] + 1, stride), *tail), stats=stats,
             )
@@ -133,5 +149,4 @@ def read_rows(
                 for target in destinations[row]:
                     output[target] = values[(row - begin) // stride]
             del values
-            position = end_position
         return output

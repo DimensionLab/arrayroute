@@ -4,15 +4,18 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from operator import index
 from pathlib import Path
 from typing import Any, cast
 
 from .backends import ZarrBackend
+from .budget import ReadBudget
 from .plan import Selection
 from .reader import ArrayReader, ReadStats
 from .remote import S3Store, _path
+from .rows import read_rows
 
 
 @dataclass(frozen=True)
@@ -139,6 +142,10 @@ class SnapshotReadSession:
     Local reads use a 1 MiB range-splitting target to avoid subdividing small files.
     Remote repositories keep the storage backend's target. range_request_bytes
     overrides either policy without changing the persisted repository configuration.
+
+    Sessions are worker-owned and not thread-safe. Independent thread sessions may
+    share one process-local read_budget; create new pools after spawn. Retained
+    outputs and the native caches remain outside that planned-buffer allowance.
     """
 
     def __init__(
@@ -151,6 +158,7 @@ class SnapshotReadSession:
         metadata_entries: int = 1024,
         concurrency: int = 8,
         range_request_bytes: int | None = None,
+        read_budget: ReadBudget | None = None,
     ):
         if not isinstance(snapshot, Snapshot):
             raise TypeError("Resolve and pin a Snapshot before creating a read session")
@@ -173,6 +181,9 @@ class SnapshotReadSession:
         self.metadata_entries = metadata_entries
         self.concurrency = concurrency
         self.range_request_bytes = range_request_bytes
+        if read_budget is not None and not isinstance(read_budget, ReadBudget):
+            raise TypeError("read_budget must be a process-local ReadBudget")
+        self.read_budget = read_budget
         self._session: Any = None
         self._readers: OrderedDict[str, ArrayReader] = OrderedDict()
 
@@ -181,6 +192,8 @@ class SnapshotReadSession:
         self._session = None
 
     def __getstate__(self) -> dict:
+        if self.read_budget is not None:
+            raise TypeError("Shared budgets are in-process only; create a new pool after spawn")
         return {**vars(self), "_session": None, "_readers": OrderedDict()}
 
     @property
@@ -224,7 +237,9 @@ class SnapshotReadSession:
             )
             self._session = repository.readonly_session(snapshot_id=self.snapshot.snapshot_id)
         array = zarr.open_array(store=self._session.store, path=path, mode="r")
-        reader = ArrayReader(ZarrBackend(array), buffer_bytes=self.buffer_bytes)
+        reader = ArrayReader(
+            ZarrBackend(array), buffer_bytes=self.buffer_bytes, shared_budget=self.read_budget
+        )
         while len(self._readers) >= self.max_open_arrays:
             self._readers.popitem(last=False)
         self._readers[path] = reader
@@ -236,3 +251,24 @@ class SnapshotReadSession:
     def attributes(self, array_path: str) -> dict[str, Any]:
         """Copy array attributes from the same revision as its numerical data."""
         return dict(cast(ZarrBackend, self.open(array_path).backend).array.attrs)
+
+    def read_rows(
+        self,
+        array_path: str,
+        indices: Sequence[int],
+        *,
+        tail: Selection | None = None,
+        coalesce: bool = True,
+        stats: ReadStats | None = None,
+        cancelled: Callable[[], bool] | None = None,
+    ):
+        """Gather an ordered leading-axis batch from this exact revision.
+
+        Repeated and negative indices retain caller order. The full output and one
+        bounded read are admitted together; cancellation cannot interrupt native I/O.
+        Clearing handles or advancing a branch never changes this session's revision.
+        """
+        return read_rows(
+            self.open(array_path), indices, tail=tail, coalesce=coalesce,
+            stats=stats, cancelled=cancelled,
+        )
