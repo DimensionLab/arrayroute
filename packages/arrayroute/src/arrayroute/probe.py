@@ -94,7 +94,9 @@ def probe_reads(
     del metadata_reader
     report = {
         'state': 'running', 'selections': len(selections), 'dtype': dtype.str,
-        'source_shape': spec.shape, 'source_chunks': spec.chunks,
+        'source_shape': spec.shape,
+        'source_chunks': None if spec.contiguous else spec.chunks,
+        'source_storage_layout': 'contiguous' if spec.contiguous else 'chunked',
         'regions': [[{'start': s.start, 'stop': s.stop, 'step': s.step}
                      if isinstance(s, slice) else s for s in selection]
                     for selection in normalized],

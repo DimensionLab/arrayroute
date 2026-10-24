@@ -1,7 +1,7 @@
 # ArrayRoute
 
 Experimental Apache-2.0 selection planning for chunked scientific arrays, usable without
-Frontier. Zarr-Python, TensorStore and Zarrista adapters implement the same backend protocol.
+Frontier. Zarr-Python, TensorStore, Zarrista and HDF5 adapters share the same read protocol.
 No cloud credentials, scheduler or application account is required.
 
 From a source checkout, install the package and the backends you need:
@@ -226,7 +226,51 @@ snapshot sessions when a concurrent writer must be supported. The native cache s
 **soft** eviction limit, not a hard process-memory bound. See TensorStore's
 [cache and freshness options](https://google.github.io/tensorstore/python/api/tensorstore.TensorStore.spec.html).
 
-### Share native resources across reader threads
+### Local HDF5 arrays and projected tables
+
+Install the `hdf5` extra to read embedded, fixed-size HDF5 arrays:
+
+```python
+from arrayroute.hdf5 import HDF5ReadSession
+
+with HDF5ReadSession("simulation.h5", buffer_bytes=32 << 20) as source:
+    pressure = source.open("fields/pressure")
+    for tile, values in pressure.stream((0, slice(None), slice(None), slice(None))):
+        consume(tile.destination, values)
+        del values
+
+    # Separate output admission from temporary read buffers.
+    table = source.read_columns("parameters", columns=["inlet_velocity", "head"],
+                                max_output_bytes=64 << 20)
+    summary = source.inspect_columns("parameters")
+```
+
+Contiguous datasets use hyperslab reads with no decoded-chunk charge; chunked datasets
+conservatively charge every intersected decoded chunk. `ArraySpec.contiguous` distinguishes
+these contracts. Its `chunks` field is only a positive shape placeholder for contiguous
+storage, not a physical chunk grid. Probe reports expose `source_storage_layout` and use
+`source_chunks: null` for contiguous storage. Native codec scratch, metadata and consumer
+retention are additional memory. The HDF5 raw chunk cache is disabled.
+
+Column projection admits only requested one-dimensional columns and preserves their order.
+Inspection streams finite counts and extrema, retaining native integer precision. Fixed-size
+strings may be inspected as numbers; variable-length strings, references, null/scalar arrays,
+compact datasets, virtual datasets, external raw storage and soft/external links are rejected.
+This embedded-data policy is not a sandbox for native HDF5 code or third-party filters.
+
+Sources must remain immutable while open. Exact values, dtype and selection order are
+preserved; this adapter does not create a transactional snapshot. Reopen the file inside each
+spawned process. Sessions cannot be pickled, reused after fork or used after close. h5py
+serializes native calls across threads; this adapter does not promise threaded HDF5 scaling,
+MPI I/O, remote object-store access or direct GPU delivery.
+
+Run `python -m arrayroute.benchmark_hdf5 --output ./hdf5-results` for a local comparison of
+full-table loading, projected loading and streamed inspection. It generates a compressed
+24-column table (192 MB decoded by default), runs fresh processes in seeded shuffled order,
+checks result hashes and removes the fixture after successful completion. Install the `hdf5`
+extra first. This is a synthetic workstation measurement, not a petabyte benchmark.
+
+## Share native resources across reader threads
 
 `TensorStoreReadGroup` gives independent worker sessions one native cache and I/O/copy
 thread budget. Create the group once, then create a session inside each worker:

@@ -61,8 +61,13 @@ class ArraySpec:
     decode_window: DecodeWindow | None = None
     dense_gather: bool = False
     gather_window: GatherWindow | None = None
+    contiguous: bool = False
 
     def __post_init__(self) -> None:
+        if not isinstance(self.contiguous, bool):
+            raise TypeError("contiguous must be a boolean")
+        if self.contiguous and (self.decode_window or self.dense_gather or self.gather_window):
+            raise ValueError("Contiguous storage cannot declare chunk decoding or gathering")
         if not isinstance(self.dense_gather, bool):
             raise TypeError("dense_gather must be a boolean")
         if self.decode_window is not None and not isinstance(self.decode_window, DecodeWindow):
@@ -146,7 +151,7 @@ def plan(spec: ArraySpec, selection: Selection, *, buffer_bytes: int | None = No
                 raise IndexError(f"Index {sel} outside dimension of size {size}")
             normalized.append(index)
             counts.append(1)
-    touched = math.prod(counts)
+    touched = 0 if spec.contiguous else math.prod(counts)
     live_chunks = touched
     window = spec.decode_window
     if window is not None and (
@@ -263,6 +268,8 @@ def tiles(spec: ArraySpec, selection: Selection, *, buffer_bytes: int) -> Iterat
         def split_priority(pair: tuple[int, slice]) -> tuple[int, int]:
             axis, region = pair
             count = _length(region)
+            if spec.contiguous:
+                return 1, count
             last = region.start + (count - 1) * region.step
             touched = min(count, last // spec.chunks[axis] - region.start // spec.chunks[axis] + 1)
             # Cutting within one chunk cannot reduce decoded bytes. Split across chunks first.
@@ -272,7 +279,7 @@ def tiles(spec: ArraySpec, selection: Selection, *, buffer_bytes: int) -> Iterat
         count = _length(sel)
         chunk = spec.chunks[axis]
         midpoint = sel.start + (count // 2) * sel.step
-        boundary = (midpoint // chunk) * chunk
+        boundary = midpoint if spec.contiguous else (midpoint // chunk) * chunk
         cut = min(count - 1, max(1, (boundary - sel.start + sel.step - 1) // sel.step))
         source_cut = sel.start + cut * sel.step
         out_axis = sum(isinstance(s, slice) for s in tile.plan.selection[:axis])
