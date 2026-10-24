@@ -2173,3 +2173,39 @@ allowance. A single complete sequence step must fit; this helper does not spatia
 oversized frames. Sources remain immutable and caller-owned. Shared reader pools admit
 I/O, not retained consumer arrays. Cancellation is checked between reads. Consumers own
 numerical reduction order; batching by itself does not guarantee deterministic arithmetic.
+
+## Tiled ensemble diagnostics
+
+`arrayroute.ensemble_curves.ensemble_curves` scores an ensemble reader shaped
+`(member, time, spatial..., component)` against a reference reader shaped
+`(time, spatial..., component)`. It computes spread, ensemble-mean RMSE, the finite-ensemble
+spread/skill ratio, Gaussian interval coverage, Gaussian CRPS, optional conformal coverage
+and evenly spaced normalized residuals. Spatial frames remain tiled.
+
+```python
+from arrayroute.ensemble_curves import ALGORITHM, ensemble_curves
+
+curves = ensemble_curves(ensemble_reader, reference_reader, z_nominal=1.645,
+                         steps=100, n_scores=64, buffer_bytes=64 << 20)
+print(ALGORITHM, curves["spread"], curves["coverage"])
+```
+
+Record `ensemble-time-space-curves-v1-256-8` with results. Fixed eight-frame blocks and
+spatial groups of at most 256 points preserve numerical order across admitted I/O windows,
+chunks and tested layouts on the same numerical stack. Shape, member order and selected
+prefix are part of that contract. It does not promise cross-platform bit identity or
+bitwise identity to earlier monolithic/framewise NumPy reductions.
+
+Output/state, retained inputs and conservative numerical scratch are admitted before
+payload reads. Backend-owned derived workspace, caches and codec scratch remain additional;
+this is not an RSS ceiling. Members and channels within one canonical tile must fit.
+Reference values must be finite; no validity masks are accepted. The consumer validates
+matching geometry, times and physical units. Sources remain immutable and caller-owned.
+
+Spread, RMSE and CRPS retain the field's units; coverage, ratio and normalized residuals
+are dimensionless. Components must use compatible units. CRPS here describes the fitted
+Gaussian predictive distribution, not empirical ensemble CRPS. Its error-function
+approximation has absolute error at most 1.5e-7, contributing at most approximately
+`abs(reference - mean) * 1.5e-7` to CRPS error, plus floating-point roundoff. Zero spread
+uses absolute error for CRPS. Undefined ratios remain NaN; nonfinite spread, RMSE and CRPS
+become infinity. Short conformal-factor vectors hold their final nonnegative finite value.
