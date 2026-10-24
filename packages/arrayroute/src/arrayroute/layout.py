@@ -56,6 +56,8 @@ class GridLayoutPolicy:
         axes = tuple(index(a) for a in spatial_axes)
         itemsize, steps = index(itemsize), index(steps_per_chunk)
         time_axis = None if time_axis is None else index(time_axis)
+        if self.chunk_bytes < itemsize:
+            raise ValueError("Chunk byte limit must fit at least one element")
         if not shape or min(shape) < 1 or itemsize < 1 or steps < 1:
             raise ValueError("Grid extents, item size and steps per chunk must be positive")
         if not 1 <= len(axes) <= 3 or len(set(axes)) != len(axes):

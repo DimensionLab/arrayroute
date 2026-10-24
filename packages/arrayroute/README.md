@@ -1803,3 +1803,30 @@ staging. Unsupported exclusive rename fails explicitly. This is atomic visibilit
 power-loss durability or resumable conversion. Close all writers before context exit; keep
 the parent directory trusted and stable. Abrupt process termination can leave a hidden
 `.arrayroute-*.partial` container for explicit cleanup. No dataset payload copy is added.
+
+### Bounded array transfers
+
+`arrayroute.transfer.BlockArray` describes a borrowed source through its shape, dtype and
+region reader. `copy_blocks` visits unit-stride regions in lexicographic order and waits for
+each sink write before reading the next block. It checks the declared buffer allowance
+before reading, validates returned shapes/dtypes, and supports cancellation between reads
+and writes. Use storage-shard boundaries as `block_shape` to avoid rewriting a shard for
+every small chunk.
+
+```python
+from arrayroute.transfer import BlockArray, copy_blocks
+
+source = BlockArray.from_array(array)  # no payload copy for an existing ndarray
+copy_blocks(
+    source,
+    lambda region, values: destination.__setitem__(region, values),
+    block_shape=destination.shards or destination.chunks,
+    dtype=destination.dtype,
+    buffer_bytes=64 << 20,
+)
+```
+
+The allowance covers a returned source block plus a contiguous conversion buffer. Source
+ownership, reader scratch, sink codec buffers and OS caches are separate. A sink must finish
+consuming the supplied buffer before returning. Source owners must remain open throughout
+transfer. Publication belongs to the caller; use `staged_directory` for new local datasets.
