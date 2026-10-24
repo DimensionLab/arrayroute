@@ -87,6 +87,8 @@ def _grid_regions(
 
 
 class ZarrBackend:
+    point_output_copies = 2
+
     def __init__(self, array: Any):
         self.array = array
         self.dtype = np.dtype(array.dtype)
@@ -104,17 +106,32 @@ class ZarrBackend:
     def read(self, selection: Selection) -> np.ndarray:
         return np.asarray(self.array[selection])
 
+    def read_points(self, coordinates: tuple[np.ndarray, ...]) -> np.ndarray:
+        return np.asarray(self.array.vindex[coordinates])
+
 
 class TensorStoreBackend:
+    point_output_copies = 1
+
     def __init__(self, array: Any):
+        if any(array.origin):
+            raise ValueError("TensorStore views must have zero origins and aligned chunk grids")
         self.array = array
         self.dtype = np.dtype(array.dtype.numpy_dtype)
         self.spec = ArraySpec(
             tuple(array.shape), tuple(array.chunk_layout.read_chunk.shape), self.dtype.itemsize
         )
+        if any(
+            origin % chunk for origin, chunk in zip(
+                array.chunk_layout.grid_origin, self.spec.chunks, strict=True)
+        ):
+            raise ValueError("TensorStore views must have zero origins and aligned chunk grids")
 
     def read(self, selection: Selection) -> np.ndarray:
         return np.asarray(self.array[selection].read().result())
+
+    def read_points(self, coordinates: tuple[np.ndarray, ...]) -> np.ndarray:
+        return np.asarray(self.array.vindex[coordinates].read().result())
 
 
 class ZarristaBackend:

@@ -24,6 +24,104 @@ class Observed:
         return self.values[selection].copy()
 
 
+class PointObserved(Observed):
+    point_output_copies = 2
+
+    def read_points(self, coordinates):
+        self.calls.append(coordinates)
+        return self.values[coordinates].copy()
+
+
+@pytest.mark.parametrize("dtype", ["<f4", ">f4", "<f8", "i2"])
+def test_native_points_budget_bits_order_and_duplicates(dtype):
+    rng = np.random.default_rng(23)
+    values = np.frombuffer(rng.bytes(31 * 29 * np.dtype(dtype).itemsize), dtype=dtype)
+    values = values.reshape(31, 29)
+    backend = PointObserved(values, (4, 5))
+    view = values[2::3, 1::2]
+    ids = [0, -1, 13, 0, 26, 40, -3]
+    reader = ArrayReader(backend, buffer_bytes=1024)
+    stats = ReadStats()
+    result = take_flat(reader, ids, selection=(slice(2, None, 3), slice(1, None, 2)), stats=stats)
+    assert result.tobytes() == view.ravel()[ids].tobytes()
+    seen = set()
+    for coords in backend.calls:
+        chunks = {tuple(p) for p in np.column_stack(coords) // (4, 5)}
+        assert seen.isdisjoint(chunks)
+        seen.update(chunks)
+        assert len(chunks) * 20 * values.dtype.itemsize + 3 * result.nbytes <= 1024
+    assert stats.planned_chunk_visits == len(seen)
+    assert stats.read_strategies == {"native-points": len(backend.calls)}
+
+
+def test_native_scalar_view_cancellation_and_invalid_output_release_budget():
+    values = np.arange(100, dtype="int32").reshape(10, 10)
+    backend = PointObserved(values, (2, 2))
+    pool = ReadBudget(256)
+    reader = ArrayReader(backend, shared_budget=pool)
+    np.testing.assert_array_equal(take_flat(reader, [0, -1, 0], selection=(1, 2)), [12, 12, 12])
+    backend.calls.clear()
+    with pytest.raises(InterruptedError):
+        take_flat(reader, [0, 99], cancelled=lambda: bool(backend.calls))
+    assert pool.snapshot()["used_bytes"] == 0
+    backend.read_points = lambda _: np.zeros(1, dtype="float64")
+    with pytest.raises(ValueError, match="shape or dtype"):
+        take_flat(reader, [0, 99])
+    assert pool.snapshot()["used_bytes"] == 0
+
+
+def test_tensorstore_rejects_nonzero_domain_instead_of_misaddressing_points():
+    import tensorstore as ts
+
+    from arrayroute.backends import TensorStoreBackend
+
+    with pytest.raises(ValueError, match="zero origins"):
+        TensorStoreBackend(ts.array(np.arange(10))[2:])
+
+
+@pytest.mark.parametrize("engine", ["tensorstore", "zarr-python"])
+def test_native_points_on_sharded_arrays(tmp_path, engine):
+    import zarr
+
+    values = np.arange(7 * 9, dtype="float32").reshape(7, 9)
+    path = tmp_path / "sharded.zarr"
+    zarr.create_array(path, data=values, chunks=(2, 3), shards=(4, 6))
+    reader = LocalReadSession(engine, buffer_bytes=512).open(path, "")
+    ids = [62, 0, 18, 18, 5]
+    stats = ReadStats()
+    result = take_flat(reader, ids, stats=stats)
+    assert result.tobytes() == values.ravel()[ids].tobytes()
+    assert "native-points" in stats.read_strategies
+
+
+@pytest.mark.parametrize("engine", ["tensorstore", "zarr-python"])
+def test_native_engine_preserves_nan_payload_and_signed_zero(tmp_path, engine):
+    import zarr
+
+    bits = np.array([0x7FC00001, 0xFFC00123, 0x80000000, 0, 0x3F800000], dtype="uint32")
+    values = np.tile(bits, 20).view("float32").reshape(10, 10)
+    path = tmp_path / "bits.zarr"
+    zarr.create_array(path, data=values, chunks=(2, 2))
+    reader = LocalReadSession(engine, buffer_bytes=256).open(path, "")
+    ids = [0, 1, 2, 3, 4, -1, 0]
+    assert take_flat(reader, ids).tobytes() == values.ravel()[ids].tobytes()
+
+
+def test_native_points_charge_outer_compressed_shards(tmp_path):
+    import zarr
+    from zarr.codecs import BytesCodec, ShardingCodec, ZstdCodec
+
+    path = tmp_path / "outer.zarr"
+    with pytest.warns(UserWarning, match="disables partial"):
+        zarr.create_array(path, shape=(32, 32), chunks=(16, 16), dtype="f4",
+                          serializer=ShardingCodec(chunk_shape=(8, 8), codecs=[BytesCodec()]),
+                          compressors=[ZstdCodec()])
+    reader = LocalReadSession("zarr-python", buffer_bytes=512).open(path, "")
+    assert reader.backend.spec.chunks == (16, 16)
+    with pytest.raises(MemoryError, match="decoded chunk"):
+        take_flat(reader, [0])
+
+
 @pytest.mark.parametrize("dtype", ["<f4", ">f4", "<f8", "i2"])
 @pytest.mark.parametrize("amplification", [1.0, 2.0])
 @pytest.mark.parametrize("selection", [None, (2, slice(1, 9, 2), slice(None)),

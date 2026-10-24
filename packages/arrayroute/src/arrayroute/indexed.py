@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import math
 import operator
+import time
 from collections.abc import Callable, Sequence
 from contextlib import nullcontext
 
@@ -67,11 +68,74 @@ def take_flat(
                    if reader.shared_budget is not None else nullcontext())
     with reservation:
         worker = ArrayReader(reader.backend, buffer_bytes=reader.buffer_bytes - 2 * output_bytes)
+        native = getattr(worker.backend, "read_points", None)
+        if callable(native) and size <= np.iinfo(np.intp).max and all(
+            n <= np.iinfo(np.intp).max for n in worker.backend.spec.shape
+        ):
+            return _native_points(worker, source, normalized, stats, check, native)
         combined = _coalesced_read(
             worker, source, normalized, stats, check, max_chunk_amplification)
         if combined is not None:
             return combined
         return _chunk_reads(worker, source, normalized, stats, check)
+
+
+def _native_points(worker, source, indices, stats, check, read_points):
+    copies = getattr(worker.backend, "point_output_copies", None)
+    if isinstance(copies, bool) or not isinstance(copies, int) or copies < 1:
+        raise TypeError("Point readers must declare positive point_output_copies")
+    output = np.empty(len(indices), dtype=worker.backend.dtype)
+    if not indices:
+        return output
+    logical = iter(np.unravel_index(np.asarray(indices, dtype=np.intp), source.shape)
+                   if source.shape else ())
+    coordinates = tuple(np.full(len(indices), s, dtype=np.intp) if isinstance(s, int)
+                        else s.start + next(logical) * s.step for s in source.selection)
+    chunk_columns = []
+    chunk_extents = []
+    for s, c, n, extent in zip(source.selection, coordinates, worker.backend.spec.chunks,
+                              worker.backend.spec.shape, strict=True):
+        if not isinstance(s, int):
+            chunk_columns.append(c // n)
+            chunk_extents.append((extent + n - 1) // n)
+    if not chunk_columns:
+        count, inverse = 1, np.zeros(len(indices), dtype=np.intp)
+    elif math.prod(chunk_extents) <= np.iinfo(np.intp).max:
+        keys = np.ravel_multi_index(tuple(chunk_columns), tuple(chunk_extents))
+        unique, inverse = np.unique(keys, return_inverse=True)
+        count = len(unique)
+    else:
+        unique, inverse = np.unique(np.column_stack(chunk_columns), axis=0, return_inverse=True)
+        count = len(unique)
+    chunk_bytes = math.prod(worker.backend.spec.chunks) * worker.backend.dtype.itemsize
+    capacity = (worker.buffer_bytes - (copies - 1) * output.nbytes) // chunk_bytes
+    if capacity < 1:
+        raise MemoryError("One decoded chunk exceeds the indexed read allowance")
+    order = np.argsort(inverse, kind="stable")
+    sorted_groups = inverse[order]
+    for start in range(0, count, capacity):
+        check()
+        stop = min(start + capacity, count)
+        lo, hi = np.searchsorted(sorted_groups, [start, stop])
+        positions = order[lo:hi]
+        points = tuple(c[positions] for c in coordinates)
+        begin = time.perf_counter()
+        values = read_points(points)
+        if (not isinstance(values, np.ndarray) or values.shape != (len(positions),)
+                or values.dtype != worker.backend.dtype):
+            raise ValueError("Point reader returned an unexpected shape or dtype")
+        check()
+        output[positions] = values
+        if stats is not None:
+            stats.requests += 1
+            stats.output_bytes += values.nbytes
+            stats.decoded_bytes_upper_bound += (stop - start) * chunk_bytes
+            stats.planned_chunk_visits += stop - start
+            stats.seconds += time.perf_counter() - begin
+            strategy = "native-points"
+            stats.read_strategies[strategy] = stats.read_strategies.get(strategy, 0) + 1
+        del values
+    return output
 
 
 def _coalesced_read(worker, source, indices, stats, check, amplification):

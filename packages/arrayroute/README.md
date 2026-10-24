@@ -45,6 +45,21 @@ from those estimates. A large logical shape is not evidence of large physical I/
 
 ### Indexed diagnostic reads and bounded row samples
 
+Zarr-Python and TensorStore adapters provide native vectorized point reads. `take_flat`
+uses them in batches of occupied chunks, admitting all decoded chunks in each batch and
+the result buffers before reading. It preserves duplicates and caller order. Native reads
+touch only occupied chunks; the rectangle-amplification setting is an upper limit and does
+not force extra reads. `ReadStats` labels these requests `native-points`.
+
+An adapter may expose `read_points(coordinates)` returning an owned one-dimensional NumPy
+array and must declare positive integer `point_output_copies`, the maximum simultaneous
+result-sized buffers during that call. The built-in Zarr adapter reserves two (its output
+and coordinate-selection copy); TensorStore reserves one. Chunks must describe the actual
+decode granularity, including outer-compressed shards. Caches, encoded transport and codec
+scratch remain additional. Backends without this capability use bounded rectangular reads.
+TensorStore views with nonzero origins or unaligned chunk grids are rejected explicitly;
+the ArrayRoute array contract uses zero-based, aligned source coordinates.
+
 `arrayroute.indexed.take_flat(reader, indices, selection=...)` gathers indices in the
 C-flattened selected view, retaining requested order, duplicates and source dtype bits.
 Negative indices count from the end. It groups requests by physical chunk and joins the
