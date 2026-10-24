@@ -2076,8 +2076,10 @@ empty intersection has infinite persistence error and must not be interpreted as
 skill. Climatology uses each point's observed times; it is a retrospective reference, not a
 forecast trained without future data.
 
-The two-pass float64 reduction uses fixed spatial groups of at most 256 points. Coalesced
-read windows can change with the I/O allowance without changing the reduction order.
+The float64 reduction uses fixed 64-frame blocks and spatial groups of at most 256 points.
+An anchored central-moment merge computes variance and correlation during the first pass;
+the second pass reads only references and masks for retrospective climatology. Coalesced
+spatial windows can change with the I/O allowance without changing the reduction order.
 Identical input values **and shape** reproduce curve bytes across storage chunk layouts,
 I/O budgets and repeated calls on the same numerical stack. Reshaping spatial axes can
 change grouping and roundoff. Cross-platform bit identity and identity to older monolithic
@@ -2085,8 +2087,11 @@ NumPy reductions are not promised. Record `ALGORITHM` with numerical results.
 
 The allowance admits numerical state, workspace, retained read windows and planned I/O.
 Backend caches, codec scratch and Python metadata are additional; it is not an RSS ceiling.
-State scales with time/component count, and a whole-time canonical spatial column must fit.
-This implementation does not yet tile that time axis or distribute a reduction across ranks.
+State scales with time/component count, while payload windows are bounded in time and space.
+A canonical 64-frame tile must fit; an entire time column is no longer required. This
+implementation does not distribute a reduction across ranks. Algorithm v2 changes the
+arithmetic grouping of temporal climatology and central moments; record its identifier
+rather than expecting bit-identical results from v1.
 Callers must separately budget simultaneous reductions; a reader's shared I/O pool does not
 reserve the numerical workspace. Cancellation is checked between reads and reductions,
 not inside blocking backend calls. Reduced memory does not imply faster full-volume scoring:

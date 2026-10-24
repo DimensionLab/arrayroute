@@ -173,3 +173,83 @@ def test_random_masked_curves_match_independent_observed_point_calculation():
         pa, ta = p - p.mean(0), t - t.mean(0)
         corr = (pa * ta).sum() / np.sqrt(np.square(pa).sum() * np.square(ta).sum())
         assert result['corr'][i] == pytest.approx(corr, rel=1e-13)
+
+
+@pytest.mark.parametrize('shape', [(1025, 513, 2), (193, 5, 19, 31, 2)])
+def test_long_rollouts_match_dense_with_bounded_time_reads(shape, monkeypatch):
+    rng = np.random.default_rng(30)
+    truth = rng.normal(size=shape)
+    pred = truth + rng.normal(size=shape) * .05
+    expected = reference(pred, truth)
+    results = []
+    for budget in [8 << 20, 32 << 20]:
+        pr, tr = reader(pred), reader(truth)
+        for r in (pr, tr):
+            original = r.backend.read
+            def bounded(selection, original=original):
+                assert selection[0].stop - selection[0].start <= 64
+                return original(selection)
+            monkeypatch.setattr(r.backend, 'read', bounded)
+        results.append(error_curves(pr, tr, buffer_bytes=budget))
+        for key in expected:
+            np.testing.assert_allclose(results[-1][key], expected[key], rtol=3e-13, atol=3e-13)
+    for key in expected:
+        assert results[0][key].tobytes() == results[1][key].tobytes()
+
+
+def test_long_masked_climate_persistence_and_correlation_are_observed_only():
+    rng = np.random.default_rng(31)
+    truth = rng.normal(size=(137, 599, 3))
+    pred = truth + rng.normal(size=truth.shape) * .1
+    valid = np.repeat(rng.random((137, 599, 1)) > .4, 3, axis=2)
+    valid[0, :300] = False
+    valid[65, 300:] = False
+    valid[66] = False
+    valid[:64, 20:30] = False
+    clean_t, clean_p = truth.copy(), pred.copy()
+    truth[~valid], pred[~valid] = np.nan, np.inf
+    expected_climate = np.where(valid, clean_t, 0).sum(0) / np.maximum(valid.sum(0), 1)
+    baseline = None
+    for budget in [16 << 20, 48 << 20]:
+        result = error_curves(reader(pred), reader(truth), validity=reader(valid),
+                              buffer_bytes=budget)
+        for i in [0, 63, 64, 65, 66, 128, 136]:
+            visible = valid[i, :, 0]
+            if not visible.any():
+                assert np.isinf(result['climatology'][i])
+                continue
+            t, p = clean_t[i, visible], clean_p[i, visible]
+            climate_error = np.linalg.norm(expected_climate[visible] - t) / np.linalg.norm(t)
+            assert result['climatology'][i] == pytest.approx(climate_error, rel=2e-13)
+            common = valid[0, :, 0] & visible
+            if not common.any():
+                assert np.isinf(result['persistence'][i])
+            else:
+                persistence = np.linalg.norm(clean_t[0, common] - clean_t[i, common])
+                persistence /= np.linalg.norm(clean_t[i, common])
+                assert result['persistence'][i] == pytest.approx(persistence, abs=2e-13)
+            pa, ta = p - p.mean(0), t - t.mean(0)
+            corr = (pa * ta).sum() / np.sqrt((pa * pa).sum() * (ta * ta).sum())
+            assert result['corr'][i] == pytest.approx(corr, rel=2e-13)
+        if baseline is not None:
+            for key in result:
+                assert baseline[key].tobytes() == result[key].tobytes()
+        baseline = result
+
+
+def test_long_rollout_chunk_and_layout_replay(tmp_path):
+    rng = np.random.default_rng(32)
+    truth = rng.normal(size=(131, 17, 33, 2))
+    pred = truth + .125
+    expected = error_curves(reader(pred), reader(truth), buffer_bytes=8 << 20)
+    for i, chunks in enumerate([(7, 5, 11, 2), (65, 17, 33, 2)]):
+        group = zarr.open_group(str(tmp_path / str(i)), mode='w')
+        group.create_array('p', data=pred, chunks=chunks)
+        group.create_array('t', data=truth, chunks=chunks)
+        actual = error_curves(ArrayReader(ZarrBackend(group['p'])),
+                              ArrayReader(ZarrBackend(group['t'])), buffer_bytes=16 << 20)
+        for key in expected:
+            assert actual[key].tobytes() == expected[key].tobytes()
+    actual = error_curves(reader(np.asfortranarray(pred)), reader(np.asfortranarray(truth)))
+    for key in expected:
+        assert actual[key].tobytes() == expected[key].tobytes()

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Canonical, two-pass error curves for time/space/channel arrays."""
+"""Deterministic space/time tiled rollout reductions."""
 from __future__ import annotations
 
 import itertools
@@ -11,68 +11,25 @@ import numpy as np
 from .plan import Selection
 from .reader import ArrayReader, ReadStats
 
-ALGORITHM = "paired-time-space-curves-v1-256"
+ALGORITHM = "paired-time-space-curves-v2-256-64"
+_TIME_BLOCK = 64
 
 
-def _regions(shape: tuple[int, ...]) -> Iterator[Selection]:
-    # Fixed spatial grouping makes reduction order independent of read allowances,
-    # storage chunks and backend completion order. Each region includes all times.
+def _regions(shape: tuple[int, ...], max_points: int = 256) -> Iterator[Selection]:
+    # Window boundaries align with canonical spatial groups, including ragged rows.
     spatial = shape[1:-1]
     axis, suffix = len(spatial) - 1, 1
-    while axis > 0 and suffix * spatial[axis] <= 256:
+    while axis > 0 and suffix * spatial[axis] <= max_points:
         suffix *= spatial[axis]
         axis -= 1
-    width = max(1, 256 // suffix)
+    canonical = min(spatial[axis], max(1, 256 // suffix)) if suffix <= 256 else 1
+    width = min(spatial[axis], max_points // suffix // canonical * canonical)
+    if width < 1:
+        raise MemoryError("Canonical spatial group exceeds read-window allowance")
     for prefix in itertools.product(*(range(n) for n in spatial[:axis])):
         for start in range(0, spatial[axis], width):
             yield (slice(None), *prefix, slice(start, min(start + width, spatial[axis])),
                    *(slice(None) for _ in spatial[axis + 1:]), slice(None))
-
-
-class _WindowRead:
-    """Keep one bounded spatial window while reducing fixed, smaller subregions."""
-
-    def __init__(self, reader: ArrayReader, capacity: int, stats: ReadStats | None):
-        self.reader, self.stats = reader, stats
-        shape = reader.backend.spec.shape
-        max_points = capacity // (shape[0] * shape[-1] * reader.backend.dtype.itemsize)
-        spatial = shape[1:-1]
-        axis, suffix = len(spatial) - 1, 1
-        while axis > 0 and suffix * spatial[axis] <= max_points:
-            suffix *= spatial[axis]
-            axis -= 1
-        self.axis = axis + 1
-        width = max_points // suffix
-        # A window boundary must never split a canonical reduction group.
-        canonical = min(spatial[axis], max(1, 256 // suffix)) if suffix <= 256 else 1
-        self.width = min(spatial[axis], width // canonical * canonical)
-        if self.width < 1:
-            raise MemoryError("Canonical time column exceeds read-window allowance")
-        self.bounds: tuple[tuple[int, int], ...] | None = None
-        self.value: np.ndarray | None = None
-
-    def read(self, region: Selection) -> np.ndarray:
-        shape = self.reader.backend.spec.shape
-        starts = [v if isinstance(v, int) else (v.start or 0) for v in region]
-        bounds = tuple(
-            (starts[i], starts[i] + 1) if 0 < i < self.axis else
-            (starts[i] // self.width * self.width,
-             min((starts[i] // self.width + 1) * self.width, size)) if i == self.axis else
-            (0, size) for i, size in enumerate(shape)
-        )
-        if bounds != self.bounds:
-            self.value = None
-            self.value = self.reader.read(tuple(slice(a, b) for a, b in bounds), stats=self.stats)
-            self.bounds = bounds
-        selected = tuple(
-            v - bounds[i][0] if isinstance(v, int) else
-            slice((v.start or 0) - bounds[i][0],
-                  (shape[i] if v.stop is None else v.stop) - bounds[i][0], v.step)
-            for i, v in enumerate(region)
-        )
-        if self.value is None:
-            raise RuntimeError("Read window is unavailable")
-        return self.value[selected]
 
 
 def error_curves(
@@ -80,21 +37,19 @@ def error_curves(
     buffer_bytes: int = 128 << 20, epsilon: float = 1e-12,
     cancelled: Callable[[], bool] | None = None, stats: ReadStats | None = None,
 ) -> dict[str, np.ndarray]:
-    """Compute per-time error, correlation, energy and persistence/climatology baselines.
+    """Score immutable (time, spatial..., component) arrays without whole-time columns.
 
-    Arrays have shape (time, spatial..., component). A binary validity array, when
-    supplied, has the same shape and a common mask across vector components. Nonfinite
-    observed reference values fail; nonfinite observed predictions score infinite error.
-    Reductions use float64 and fixed spatial groups, in two passes over immutable inputs.
-    Outputs scale with time; a 256-point time column must fit the numerical allowance.
-    Results are deterministic across I/O budgets/chunking on the same numerical stack,
-    but are not bit-identical to a monolithic NumPy reduction or promised across platforms.
+    Fixed 64-frame blocks and at most 256-point spatial groups preserve arithmetic
+    order across I/O budgets, chunks and C/Fortran layouts on the same numerical stack.
+    Temporal climatology is retrospective. Output/state is O(time * components);
+    payload windows are bounded in both time and space. Binary validity masks must
+    be common across vector components. Missing observations remain unscored.
 
-    buffer_bytes admits reduction state, conservative NumPy workspace and each planned
-    read, including retained coalesced read windows. It excludes backend caches/codec
-    scratch and metadata. Reader shared pools cover I/O reservations, not the caller-owned
-    reduction workspace. Concurrent calls need separate numerical allowances. Cancellation
-    is polled between reads/reductions; a blocking backend call cannot be interrupted.
+    The allowance covers retained windows, reduction state and conservative NumPy
+    workspace; backend caches, codec scratch and metadata are additional. Shared
+    reader budgets cover I/O only; concurrent scorers need separate numerical budgets.
+    Cancellation is polled between operations, not inside a blocking backend read.
+    No cross-platform bit identity or identity to monolithic reductions is promised.
     """
     if isinstance(buffer_bytes, bool) or not isinstance(buffer_bytes, int) or buffer_bytes < 1:
         raise ValueError("buffer_bytes must be a positive integer")
@@ -108,96 +63,133 @@ def error_curves(
            for r in readers):
         raise ValueError("Readers must have matching real numeric shapes")
     n, channels = shape[0], shape[-1]
-    state_bytes = n * (6 * channels + 32) * 8
-    workspace_bytes = n * min(math.prod(shape[1:-1]), 256) * channels * 160
-    if state_bytes + workspace_bytes >= buffer_bytes:
-        raise MemoryError("Error-curve state and canonical time column exceed numerical allowance")
-    read_allowance = (buffer_bytes - state_bytes - workspace_bytes) // 2
+    frames = min(n, _TIME_BLOCK)
+    state_bytes = n * (12 * channels + 40) * 8
+    workspace_bytes = frames * min(math.prod(shape[1:-1]), 256) * channels * 160
+    remaining = buffer_bytes - state_bytes - workspace_bytes
+    if remaining <= 0:
+        raise MemoryError("Error-curve state and canonical tile exceed numerical allowance")
+    read_allowance = remaining // 2
     readers = [ArrayReader(r.backend, buffer_bytes=min(r.buffer_bytes, read_allowance),
                            shared_budget=r.shared_budget) for r in readers]
+    per_point = channels * (frames * sum(r.backend.dtype.itemsize for r in readers) + 64)
+    max_points = min(read_allowance // per_point, *(
+        r.buffer_bytes // (2 * frames * channels * r.backend.dtype.itemsize) for r in readers))
+    if max_points < min(math.prod(shape[1:-1]), 256):
+        raise MemoryError("Canonical spatial group exceeds read-window allowance")
 
     def check() -> None:
         if cancelled is not None and cancelled():
             raise InterruptedError("Error-curve reduction cancelled")
 
-    def blocks():
-        windows = [_WindowRead(r, min(read_allowance // len(readers), r.buffer_bytes // 2),
-                               stats) for r in readers]
-        for region in _regions(shape):
-            check()
-            for r in readers:
-                plan = r.plan(region)
-                if plan.output_bytes >= r.buffer_bytes:
-                    raise MemoryError("Error-curve region exceeds the remaining read allowance")
-            raw_p = windows[0].read(region)
-            check()
-            raw_t = windows[1].read(region)
-            check()
-            p = np.array(raw_p, dtype=np.float64, order="C").reshape(n, -1, channels)
-            t = np.array(raw_t, dtype=np.float64, order="C").reshape(n, -1, channels)
-            del raw_p, raw_t
-            if validity is None:
-                mask = np.ones(t.shape, bool)
-            else:
-                raw_mask = windows[2].read(region).reshape(t.shape)
-                if not np.isin(raw_mask, [0, 1]).all():
-                    raise ValueError("Validity must contain only zero/one")
-                if not np.all(raw_mask == raw_mask[..., :1]):
-                    raise ValueError("A vector field needs one common validity mask")
-                mask = raw_mask.astype(bool, order="C")
-                del raw_mask
-            if not np.isfinite(np.where(mask, t, 0)).all():
-                raise ValueError("Nonfinite reference inside the validity mask")
-            good = np.isfinite(np.where(mask, p, 0)).all(axis=(1, 2))
-            p = np.where(mask & np.isfinite(p), p, 0)
-            t = np.where(mask, t, 0)
-            check()
-            yield p, t, mask, good
-            del p, t, mask, good
+    def read_window(reader: ArrayReader, region: Selection, start: int) -> np.ndarray:
+        check()
+        return reader.read((slice(start, min(start + frames, n)), *region[1:]), stats=stats)
+
+    def mask_for(raw: np.ndarray | None, block_shape: tuple[int, ...]) -> np.ndarray:
+        if raw is None:
+            return np.ones(block_shape, bool)
+        if not np.isin(raw, [0, 1]).all():
+            raise ValueError("Validity must contain only zero/one")
+        if not np.all(raw == raw[..., :1]):
+            raise ValueError("A vector field needs one common validity mask")
+        return raw.astype(bool, order="C")
 
     check()
     count = np.zeros(n, np.float64)
     mean_p, mean_t = np.zeros((n, channels)), np.zeros((n, channels))
+    anchor_p, anchor_t = np.zeros((n, channels)), np.zeros((n, channels))
     se, tt, pp, clim, pers, pers_tt, common_count = (np.zeros(n) for _ in range(7))
-    finite = np.ones(n, bool)
-    for p, t, mask, good in blocks():
-        finite &= good
-        bc = mask[..., 0].sum(1).astype(np.float64)
-        total = count + bc
-        first = mask[..., 0].argmax(axis=1)
-        rows = np.arange(n)
-        for values, mean in ((p, mean_p), (t, mean_t)):
-            origin = values[rows, first]
-            shifted = np.where(mask, values - origin[:, None], 0)
-            local_mean = origin + shifted.sum(1) / np.maximum(bc[:, None], 1)
-            mean += (local_mean - mean) * (bc / np.maximum(total, 1))[:, None]
-        count = total
-        d = p - t
-        se += np.einsum("tmc,tmc->t", d, d)
-        tt += np.einsum("tmc,tmc->t", t, t)
-        pp += np.einsum("tmc,tmc->t", p, p)
-        common = mask & mask[:1]
-        diff = np.where(common, t[:1] - t, 0)
-        pers += np.einsum("tmc,tmc->t", diff, diff)
-        observed = np.where(common, t, 0)
-        pers_tt += np.einsum("tmc,tmc->t", observed, observed)
-        common_count += common[..., 0].sum(1)
-        climate = t.sum(0, keepdims=True) / np.maximum(mask.sum(0, keepdims=True), 1)
-        dc = np.where(mask, climate - t, 0)
-        clim += np.einsum("tmc,tmc->t", dc, dc)
-        del p, t, mask, good, d, diff, observed, climate, dc, shifted, values, origin
-
     var_t, var_p, cov = np.zeros(n), np.zeros(n), np.zeros(n)
-    for p, t, mask, _good in blocks():
-        ta = np.where(mask, t - mean_t[:, None], 0)
-        pa = np.where(mask, p - mean_p[:, None], 0)
-        var_t += np.einsum("tmc,tmc->t", ta, ta)
-        var_p += np.einsum("tmc,tmc->t", pa, pa)
-        cov += np.einsum("tmc,tmc->t", pa, ta)
-        del p, t, mask, ta, pa
+    finite = np.ones(n, bool)
+    for window in _regions(shape, max_points):
+        climate_sum = climate_count = first_t = first_mask = None
+        for start in range(0, n, frames):
+            raw_p = read_window(readers[0], window, start)
+            raw_t = read_window(readers[1], window, start)
+            raw_mask = read_window(readers[2], window, start) if validity is not None else None
+            if climate_sum is None:
+                climate_sum = np.zeros(raw_t.shape[1:], np.float64)
+                climate_count = np.zeros(raw_t.shape[1:], np.float64)
+                first_t = np.zeros(raw_t.shape[1:], np.float64)
+                first_mask = np.zeros(raw_t.shape[1:], bool)
+            assert climate_count is not None and first_t is not None and first_mask is not None
+            k = len(raw_t)
+            frame = slice(start, start + k)
+            for region in _regions(raw_t.shape):
+                check()
+                spatial = region[1:]
+                p = np.array(raw_p[region], dtype=np.float64, order="C").reshape(k, -1, channels)
+                t = np.array(raw_t[region], dtype=np.float64, order="C").reshape(k, -1, channels)
+                mask = mask_for(None if raw_mask is None else raw_mask[region].reshape(t.shape),
+                                t.shape)
+                if not np.isfinite(np.where(mask, t, 0)).all():
+                    raise ValueError("Nonfinite reference inside the validity mask")
+                finite[frame] &= np.isfinite(np.where(mask, p, 0)).all(axis=(1, 2))
+                p = np.where(mask & np.isfinite(p), p, 0)
+                t = np.where(mask, t, 0)
+                bc = mask[..., 0].sum(1).astype(np.float64)
+                total = count[frame] + bc
+                first = mask[..., 0].argmax(axis=1)
+                rows = np.arange(k)
+                initialize = (count[frame] == 0) & (bc > 0)
+                # Subtract a fixed observed anchor before Chan's central-moment merge.
+                # This preserves small fluctuations on top of large physical offsets.
+                anchor_p[frame][initialize] = p[rows, first][initialize]
+                anchor_t[frame][initialize] = t[rows, first][initialize]
+                ps = np.where(mask, p - anchor_p[frame, None], 0)
+                ts = np.where(mask, t - anchor_t[frame, None], 0)
+                mp = ps.sum(1) / np.maximum(bc[:, None], 1)
+                mt = ts.sum(1) / np.maximum(bc[:, None], 1)
+                dp, dt = mp - mean_p[frame], mt - mean_t[frame]
+                pa = np.where(mask, ps - mp[:, None], 0)
+                ta = np.where(mask, ts - mt[:, None], 0)
+                weight = count[frame] * bc / np.maximum(total, 1)
+                var_p[frame] += np.einsum("tmc,tmc->t", pa, pa) + weight * (dp * dp).sum(1)
+                var_t[frame] += np.einsum("tmc,tmc->t", ta, ta) + weight * (dt * dt).sum(1)
+                cov[frame] += np.einsum("tmc,tmc->t", pa, ta) + weight * (dp * dt).sum(1)
+                mean_p[frame] += dp * (bc / np.maximum(total, 1))[:, None]
+                mean_t[frame] += dt * (bc / np.maximum(total, 1))[:, None]
+                count[frame] = total
+                d = p - t
+                se[frame] += np.einsum("tmc,tmc->t", d, d)
+                tt[frame] += np.einsum("tmc,tmc->t", t, t)
+                pp[frame] += np.einsum("tmc,tmc->t", p, p)
+                local_shape = climate_sum[spatial].shape
+                climate_sum[spatial] += t.sum(0).reshape(local_shape)
+                climate_count[spatial] += mask.sum(0).reshape(local_shape)
+                if start == 0:
+                    first_t[spatial] = t[0].reshape(local_shape)
+                    first_mask[spatial] = mask[0].reshape(local_shape)
+                common = mask & first_mask[spatial].reshape(1, -1, channels)
+                diff = np.where(common, first_t[spatial].reshape(1, -1, channels) - t, 0)
+                observed = np.where(common, t, 0)
+                pers[frame] += np.einsum("tmc,tmc->t", diff, diff)
+                pers_tt[frame] += np.einsum("tmc,tmc->t", observed, observed)
+                common_count[frame] += common[..., 0].sum(1)
+                del p, t, mask, ps, ts, pa, ta, d, diff, observed
+            del raw_p, raw_t, raw_mask
+        assert climate_sum is not None and climate_count is not None
+        climate_sum /= np.maximum(climate_count, 1)
+        del climate_count, first_t, first_mask
+        for start in range(0, n, frames):
+            raw_t = read_window(readers[1], window, start)
+            raw_mask = read_window(readers[2], window, start) if validity is not None else None
+            k = len(raw_t)
+            for region in _regions(raw_t.shape):
+                check()
+                t = np.array(raw_t[region], dtype=np.float64, order="C").reshape(k, -1, channels)
+                mask = mask_for(None if raw_mask is None else raw_mask[region].reshape(t.shape),
+                                t.shape)
+                dc = np.where(mask, climate_sum[region[1:]].reshape(1, -1, channels) - t, 0)
+                clim[start:start + k] += np.einsum("tmc,tmc->t", dc, dc)
+                del t, mask, dc
+            del raw_t, raw_mask
+        del climate_sum
     check()
     denominator = np.maximum(count, 1)
     total = max(float(count.sum()), 1)
+    mean_t += anchor_t
     origin = mean_t[int(np.argmax(count > 0))]
     global_mean = origin + ((mean_t - origin) * count[:, None]).sum(0) / total
     sigma = math.sqrt(float(var_t.sum() + (
